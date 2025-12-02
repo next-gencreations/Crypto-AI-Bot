@@ -1,10 +1,1 @@
-**Important:**  
-This stops secrets and logs from being uploaded.
 
----
-
-# 6. 📄 `env.example`
-
-This shows other people (or future you) how to configure the bot.
-
-Put this inside:
