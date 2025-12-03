@@ -609,7 +609,6 @@ def scan_and_open_new_positions(equity: Decimal, dd_pct: Decimal) -> None:
     # Open a long position in the best market
     open_long_position(best_market, best_price)
 
-
 def main_loop() -> None:
     global usd_balance
 
@@ -653,3 +652,13 @@ def main_loop() -> None:
         # 5) Sleep until next cycle
         log(f"Sleeping for {SLEEP_SECONDS} seconds...")
         time.sleep(SLEEP_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    ensure_directories()
+    log("Starting Crypto-AI-Bot...")
+    main_loop()
