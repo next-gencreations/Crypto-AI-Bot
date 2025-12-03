@@ -652,4 +652,4 @@ def main_loop() -> None:
 
         # 5) Sleep until next cycle
         log(f"Sleeping for {SLEEP_SECONDS} seconds...")
-        time.sleep(S
+        time.sleep(SLEEP_SECONDS)
