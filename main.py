@@ -14,6 +14,7 @@ Crypto-AI-Bot - experimental self-learning paper-trading bot for Coinbase.
 from __future__ import annotations
 
 import os
+import sys
 import csv
 import time
 import random
@@ -22,6 +23,9 @@ from datetime import datetime, timezone, date
 from typing import Dict, List, Optional, Tuple
 
 import requests
+
+# Make sure logs appear promptly on Render
+sys.stdout.reconfigure(line_buffering=True)
 
 # ---------------------------------------------------------------------------
 # Precision / global context
@@ -51,8 +55,8 @@ def ensure_directories() -> None:
 # Configuration (env + defaults)
 # ---------------------------------------------------------------------------
 
-# Starting balance from env
 def get_start_balance() -> Decimal:
+    """Starting balance from env, default $100."""
     raw = os.getenv("START_BALANCE_USD", "100").strip()
     try:
         return Decimal(raw)
@@ -95,22 +99,22 @@ PUBLIC_API_BASE = "https://api.exchange.coinbase.com"
 
 # Risk parameters by mode
 if RISK_MODE == "AGGRESSIVE":
-    TAKE_PROFIT_PCT = Decimal("0.015")    # +1.5%
-    STOP_LOSS_PCT = Decimal("0.02")       # -2.0%
-    POSITION_SIZE_FRACTION = Decimal("0.4")  # 40% of USD per new trade
-    MAX_DAILY_DRAWDOWN = Decimal("0.08")  # 8%
+    TAKE_PROFIT_PCT = Decimal("0.015")        # +1.5%
+    STOP_LOSS_PCT = Decimal("0.020")          # -2.0%
+    POSITION_SIZE_FRACTION = Decimal("0.40")  # 40% of USD per new trade
+    MAX_DAILY_DRAWDOWN = Decimal("0.08")      # 8%
     MAX_OPEN_POSITIONS = 5
 elif RISK_MODE == "NORMAL":
-    TAKE_PROFIT_PCT = Decimal("0.012")    # +1.2%
-    STOP_LOSS_PCT = Decimal("0.018")      # -1.8%
+    TAKE_PROFIT_PCT = Decimal("0.012")        # +1.2%
+    STOP_LOSS_PCT = Decimal("0.018")          # -1.8%
     POSITION_SIZE_FRACTION = Decimal("0.35")
-    MAX_DAILY_DRAWDOWN = Decimal("0.06")  # 6%
+    MAX_DAILY_DRAWDOWN = Decimal("0.06")      # 6%
     MAX_OPEN_POSITIONS = 4
 else:  # SAFE (default)
-    TAKE_PROFIT_PCT = Decimal("0.010")    # +1.0%
-    STOP_LOSS_PCT = Decimal("0.015")      # -1.5%
+    TAKE_PROFIT_PCT = Decimal("0.010")        # +1.0%
+    STOP_LOSS_PCT = Decimal("0.015")          # -1.5%
     POSITION_SIZE_FRACTION = Decimal("0.30")  # 30%
-    MAX_DAILY_DRAWDOWN = Decimal("0.05")  # 5%
+    MAX_DAILY_DRAWDOWN = Decimal("0.05")      # 5%
     MAX_OPEN_POSITIONS = 3
 
 # Indicator thresholds
@@ -236,7 +240,8 @@ def get_recent_candles(market: str, limit: int = LOOKBACK_CANDLES) -> Optional[L
     """
     Fetch recent candles using Coinbase public API.
     Returns list of candles sorted oldest -> newest:
-    [{"time": int, "open": Decimal, "high": Decimal, "low": Decimal, "close": Decimal, "volume": Decimal}, ...]
+    [{"time": int, "open": Decimal, "high": Decimal, "low": Decimal,
+      "close": Decimal, "volume": Decimal}, ...]
     """
     try:
         end_ts = int(time.time())
@@ -415,7 +420,7 @@ def compute_equity() -> Decimal:
 def update_daily_state() -> Tuple[Decimal, Decimal, Decimal]:
     """
     Update daily equity / drawdown tracking.
-    Returns (equity, drawdown_pct, daily_drawdown_lock_flag_as_decimal)
+    Returns (equity, drawdown_pct, paused_flag_as_decimal)
     """
     global equity_peak_today, today, trading_paused_for_today
 
@@ -464,6 +469,7 @@ def open_long_position(market: str, price: Decimal) -> None:
     if size <= 0:
         return
 
+    # Spend USD to buy the position
     usd_balance -= position_usd
 
     take_profit = price * (Decimal("1") + TAKE_PROFIT_PCT)
@@ -487,18 +493,25 @@ def open_long_position(market: str, price: Decimal) -> None:
 
 
 def close_position(pos: Dict, price: Decimal) -> None:
+    """
+    Close a long position and correctly compute USD profit.
+
+    We already subtracted the cost when opening the position,
+    so here we:
+      - compute profit = (exit - entry) * size
+      - add back full sale value = size * exit_price
+    """
     global usd_balance
 
     market = pos["market"]
     size: Decimal = pos["size"]
     entry_price: Decimal = pos["entry_price"]
 
-    usd_before = usd_balance
+    # Net profit on this position
+    profit_usd = (price - entry_price) * size
 
-    usd_change = (price - entry_price) * size
-    usd_balance += (size * price)
-
-    profit_usd = usd_balance - usd_before
+    # Add back the sale value of the position
+    usd_balance += size * price
 
     # Update learning stats
     stats = market_stats.setdefault(market, {"wins": 0, "losses": 0})
@@ -639,14 +652,4 @@ def main_loop() -> None:
 
         # 5) Sleep until next cycle
         log(f"Sleeping for {SLEEP_SECONDS} seconds...")
-        time.sleep(SLEEP_SECONDS)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    ensure_directories()
-    log("Starting Crypto-AI-Bot...")
-    main_loop()
+        time.sleep(S
