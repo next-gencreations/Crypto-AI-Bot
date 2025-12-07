@@ -90,38 +90,38 @@ ALL_MARKETS: List[str] = [
 MAX_MARKETS_PER_SCAN = 8
 
 # Loop timing & candles
-SLEEP_SECONDS = 6 * 60          # 6 minutes
-CANDLE_GRANULARITY = 300        # 5-minute candles
+SLEEP_SECONDS = 6 * 60           # 6 minutes
+CANDLE_GRANULARITY = 300         # 5-minute candles
 LOOKBACK_CANDLES = 100
 
 PUBLIC_API_BASE = "https://api.exchange.coinbase.com"
 
 # Risk parameters by mode
 if RISK_MODE == "AGGRESSIVE":
-    TAKE_PROFIT_PCT = Decimal("0.015")      # +1.5%
-    STOP_LOSS_PCT = Decimal("0.02")         # -2.0%
+    TAKE_PROFIT_PCT = Decimal("0.015")       # +1.5%
+    STOP_LOSS_PCT = Decimal("0.02")          # -2.0%
     POSITION_SIZE_FRACTION = Decimal("0.4")  # 40% of USD per new trade
-    MAX_DAILY_DRAWDOWN = Decimal("0.08")    # 8%
+    MAX_DAILY_DRAWDOWN = Decimal("0.08")     # 8%
     MAX_OPEN_POSITIONS = 5
 elif RISK_MODE == "NORMAL":
-    TAKE_PROFIT_PCT = Decimal("0.012")      # +1.2%
-    STOP_LOSS_PCT = Decimal("0.018")        # -1.8%
-    POSITION_SIZE_FRACTION = Decimal("0.35")  # 35%
-    MAX_DAILY_DRAWDOWN = Decimal("0.06")    # 6%
+    TAKE_PROFIT_PCT = Decimal("0.012")       # +1.2%
+    STOP_LOSS_PCT = Decimal("0.018")         # -1.8%
+    POSITION_SIZE_FRACTION = Decimal("0.35") # 35%
+    MAX_DAILY_DRAWDOWN = Decimal("0.06")     # 6%
     MAX_OPEN_POSITIONS = 4
 else:  # SAFE (default)
-    TAKE_PROFIT_PCT = Decimal("0.010")      # +1.0%
-    STOP_LOSS_PCT = Decimal("0.015")        # -1.5%
-    POSITION_SIZE_FRACTION = Decimal("0.30")  # 30%
-    MAX_DAILY_DRAWDOWN = Decimal("0.05")    # 5%
+    TAKE_PROFIT_PCT = Decimal("0.010")       # +1.0%
+    STOP_LOSS_PCT = Decimal("0.015")         # -1.5%
+    POSITION_SIZE_FRACTION = Decimal("0.30") # 30%
+    MAX_DAILY_DRAWDOWN = Decimal("0.05")     # 5%
     MAX_OPEN_POSITIONS = 3
 
-# Indicator thresholds
-MIN_TREND_STRENGTH = Decimal("0.002")  # short MA must be > long MA by 0.2%
-RSI_BUY_MIN = Decimal("40")
-RSI_BUY_MAX = Decimal("65")
-MIN_VOLATILITY = Decimal("0.002")      # 0.2% avg candle move
-MAX_VOLATILITY = Decimal("0.030")      # 3% avg candle move
+# Indicator thresholds – *loosened* for more trades and more data
+MIN_TREND_STRENGTH = Decimal("0.001")  # was 0.002
+RSI_BUY_MIN = Decimal("35")            # was 40
+RSI_BUY_MAX = Decimal("70")            # was 65
+MIN_VOLATILITY = Decimal("0.001")      # was 0.002
+MAX_VOLATILITY = Decimal("0.050")      # was 0.030
 
 # ---------------------------------------------------------------------------
 # State
@@ -143,9 +143,7 @@ open_positions: List[Dict] = []
 
 # Simple per-market performance stats for "online learning"
 # market_stats[market] = {"wins": int, "losses": int}
-market_stats: Dict[str, Dict[str, int]] = {
-    m: {"wins": 0, "losses": 0} for m in ALL_MARKETS
-}
+market_stats: Dict[str, Dict[str, int]] = {m: {"wins": 0, "losses": 0} for m in ALL_MARKETS}
 
 # Equity & risk tracking
 equity_peak_today: Decimal = START_BALANCE_USD
@@ -161,6 +159,7 @@ def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line)
+
     try:
         with open(RUNTIME_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -269,6 +268,7 @@ def log_training_event_csv(
         "stop_loss_pct",
         "risk_mode",
     ]
+
     row = [
         entry_time.isoformat(),
         exit_time.isoformat(),
@@ -285,6 +285,7 @@ def log_training_event_csv(
         f"{STOP_LOSS_PCT * Decimal('100'):.2f}",
         RISK_MODE,
     ]
+
     append_csv_row(TRAINING_LOG_PATH, header, row)
 
 
@@ -414,334 +415,3 @@ def get_market_score(
     candles = get_recent_candles(market)
     if not candles:
         return Decimal("-999"), None, None, None
-
-    closes: List[Decimal] = [c["close"] for c in candles]
-
-    short_ma = sma(closes, 9)
-    long_ma = sma(closes, 21)
-    current_rsi = rsi(closes, 14)
-    vol = estimate_volatility(closes[-20:])
-
-    if short_ma is None or long_ma is None or current_rsi is None or vol is None:
-        return Decimal("-999"), None, closes, None
-
-    # Basic filters
-    if short_ma <= long_ma * (Decimal("1") + MIN_TREND_STRENGTH):
-        return Decimal("-999"), None, closes, None
-
-    if not (RSI_BUY_MIN <= current_rsi <= RSI_BUY_MAX):
-        return Decimal("-999"), None, closes, None
-
-    if not (MIN_VOLATILITY <= vol <= MAX_VOLATILITY):
-        return Decimal("-999"), None, closes, None
-
-    price = closes[-1]
-
-    # Base score from indicators
-    trend_strength = (short_ma - long_ma) / long_ma
-    rsi_centered = (Decimal("55") - abs(current_rsi - Decimal("55"))) / Decimal("55")  # best around 55
-    vol_factor = (vol - MIN_VOLATILITY) / (MAX_VOLATILITY - MIN_VOLATILITY)
-
-    base_score = trend_strength * Decimal("2.0") + rsi_centered + vol_factor
-
-    # Online-learning tweak: reward markets with higher win-rate
-    stats = market_stats.get(market, {"wins": 0, "losses": 0})
-    wins = stats["wins"]
-    losses = stats["losses"]
-    total = wins + losses
-    if total > 0:
-        win_rate = Decimal(wins) / Decimal(total)
-        learn_bonus = (win_rate - Decimal("0.5")) * Decimal("0.5")  # +/- 0.25
-    else:
-        learn_bonus = Decimal("0")
-
-    score = base_score + learn_bonus
-
-    features = {
-        "trend_strength": trend_strength,
-        "rsi": current_rsi,
-        "volatility": vol,
-    }
-
-    return score, price, closes, features
-
-
-def get_random_markets_to_scan() -> List[str]:
-    n = min(MAX_MARKETS_PER_SCAN, len(ALL_MARKETS))
-    return random.sample(ALL_MARKETS, k=n)
-
-
-# ---------------------------------------------------------------------------
-# Equity & risk helpers
-# ---------------------------------------------------------------------------
-
-def compute_equity() -> Decimal:
-    """USD balance + market value of open positions."""
-    total = usd_balance
-    for pos in open_positions:
-        price = get_latest_price(pos["market"])
-        if price is None:
-            continue
-        total += pos["size"] * price
-    return total
-
-
-def update_daily_state() -> Tuple[Decimal, Decimal, Decimal]:
-    """
-    Update daily equity / drawdown tracking.
-    Returns (equity, drawdown_pct, paused_flag_as_decimal)
-    """
-    global equity_peak_today, today, trading_paused_for_today
-
-    now = datetime.now(timezone.utc)
-    current_day = now.date()
-
-    if current_day != today:
-        # New day: reset
-        today = current_day
-        equity_peak_today = compute_equity()
-        trading_paused_for_today = False
-        log("New trading day: resetting daily drawdown and pause flags.")
-
-    equity = compute_equity()
-    if equity > equity_peak_today:
-        equity_peak_today = equity
-
-    # Drawdown relative to today's peak
-    if equity_peak_today > 0:
-        dd_pct = (equity_peak_today - equity) / equity_peak_today
-    else:
-        dd_pct = Decimal("0")
-
-    if dd_pct >= MAX_DAILY_DRAWDOWN:
-        trading_paused_for_today = True
-
-    return equity, dd_pct, Decimal("1") if trading_paused_for_today else Decimal("0")
-
-
-# ---------------------------------------------------------------------------
-# Position management
-# ---------------------------------------------------------------------------
-
-def open_long_position(
-    market: str,
-    price: Decimal,
-    features: Optional[Dict[str, Decimal]] = None,
-) -> None:
-    """Open a new long position if we have room and enough USD."""
-    global usd_balance
-
-    if len(open_positions) >= MAX_OPEN_POSITIONS:
-        return
-
-    # Fixed fraction of current USD balance
-    position_usd = usd_balance * POSITION_SIZE_FRACTION
-    if position_usd < Decimal("10"):
-        return  # don't bother with tiny trades
-
-    size = (position_usd / price).quantize(Decimal("0.00000001"))
-    if size <= 0:
-        return
-
-    usd_balance -= position_usd
-
-    take_profit = price * (Decimal("1") + TAKE_PROFIT_PCT)
-    stop_loss = price * (Decimal("1") - STOP_LOSS_PCT)
-
-    pos = {
-        "market": market,
-        "size": size,
-        "entry_price": price,
-        "entry_time": datetime.now(timezone.utc),
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "features": features or {},
-    }
-    open_positions.append(pos)
-
-    log(
-        f"OPEN LONG {market} size={size} entry={price:.2f} "
-        f"TP={take_profit:.2f} SL={stop_loss:.2f} "
-        f"usd_balance_after={usd_balance:.2f}"
-    )
-
-
-def close_position(pos: Dict, price: Decimal) -> None:
-    """Close an existing long position at the given price."""
-    global usd_balance
-
-    market = pos["market"]
-    size: Decimal = pos["size"]
-    entry_price: Decimal = pos["entry_price"]
-
-    # PnL in USD
-    usd_change = (price - entry_price) * size
-    usd_balance += size * price
-    profit_usd = usd_change
-
-    # Update learning stats
-    stats = market_stats.setdefault(market, {"wins": 0, "losses": 0})
-    if profit_usd > 0:
-        stats["wins"] += 1
-    else:
-        stats["losses"] += 1
-
-    equity_after = compute_equity()
-    side = "LONG"
-
-    log(
-        f"CLOSE {side} {market} size={size} entry={entry_price:.2f} exit={price:.2f} "
-        f"profit={profit_usd:.2f} equity_after={equity_after:.2f} "
-        f"wins={stats['wins']} losses={stats['losses']}"
-    )
-
-    now = datetime.now(timezone.utc)
-    log_trade_csv(
-        timestamp=now,
-        market=market,
-        side=side,
-        size=size,
-        entry_price=entry_price,
-        exit_price=price,
-        profit_usd=profit_usd,
-        equity_after=equity_after,
-    )
-
-    # Extra learning log with indicators at entry
-    try:
-        log_training_event_csv(
-            entry_time=pos["entry_time"],
-            exit_time=now,
-            market=market,
-            features=pos.get("features") or {},
-            entry_price=entry_price,
-            exit_price=price,
-            profit_usd=profit_usd,
-        )
-    except Exception as e:
-        log(f"WARNING: failed to log training event: {e}")
-
-
-def manage_open_positions() -> None:
-    """Check TP/SL for all open positions and close if hit."""
-    global open_positions
-
-    remaining: List[Dict] = []
-
-    for pos in open_positions:
-        market = pos["market"]
-        price = get_latest_price(market)
-        if price is None:
-            remaining.append(pos)
-            continue
-
-        hit_tp = price >= pos["take_profit"]
-        hit_sl = price <= pos["stop_loss"]
-
-        if hit_tp or hit_sl:
-            close_position(pos, price)
-        else:
-            remaining.append(pos)
-
-    open_positions = remaining
-
-
-# ---------------------------------------------------------------------------
-# Main trading logic
-# ---------------------------------------------------------------------------
-
-def scan_and_open_new_positions(equity: Decimal, dd_pct: Decimal) -> None:
-    """Scan random markets, score them, and open new positions if allowed."""
-    if trading_paused_for_today:
-        log("Daily drawdown limit hit. Pausing new entries for the rest of the day.")
-        return
-
-    if len(open_positions) >= MAX_OPEN_POSITIONS:
-        log("Max open positions reached; skipping new entries this cycle.")
-        return
-
-    markets_to_scan = get_random_markets_to_scan()
-    log(f"Scanning {len(markets_to_scan)} random markets this cycle...")
-
-    best_score = Decimal("-999")
-    best_market: Optional[str] = None
-    best_price: Optional[Decimal] = None
-    best_features: Optional[Dict[str, Decimal]] = None
-
-    for m in markets_to_scan:
-        # Skip if we already have a position in this market
-        if any(pos["market"] == m for pos in open_positions):
-            continue
-
-        score, price, _, feats = get_market_score(m)
-        log(f"Market {m} score {score:.4f}")
-        if price is None:
-            continue
-
-        if score > best_score:
-            best_score = score
-            best_market = m
-            best_price = price
-            best_features = feats
-
-    if best_market is None or best_price is None or best_score <= Decimal("-998"):
-        log("No suitable new market found this cycle.")
-        return
-
-    # Open a long position in the best market
-    open_long_position(best_market, best_price, best_features)
-
-
-def main_loop() -> None:
-    global usd_balance
-
-    log("=" * 70)
-    log("CRYPTO-AI-BOT PAPER TRADING")
-    log("NO REAL MONEY. NO REAL ORDERS. PUBLIC DATA ONLY.")
-    log(f"Starting balance: ${START_BALANCE_USD}")
-    log(f"Risk mode: {RISK_MODE}")
-    log("=" * 70)
-
-    while True:
-        try:
-            # 1) Update equity & daily state
-            equity, dd_pct, paused_flag = update_daily_state()
-
-            # 2) Manage existing positions (TP/SL)
-            manage_open_positions()
-
-            # 3) Try to open new positions if allowed
-            scan_and_open_new_positions(equity, dd_pct)
-
-            # 4) Log equity curve
-            now = datetime.now(timezone.utc)
-            open_count = len(open_positions)
-            log(
-                f"Summary: USD=${usd_balance:.2f}, positions={open_count}, "
-                f"Equity=${equity:.2f}, DD={dd_pct * 100:.2f}%, "
-                f"PausedToday={'YES' if trading_paused_for_today else 'NO'}"
-            )
-            log_equity_csv(
-                timestamp=now,
-                equity=equity,
-                usd_balance_=usd_balance,
-                open_positions_count=open_count,
-                drawdown_pct=dd_pct * Decimal("100"),
-            )
-
-        except Exception as e:
-            log(f"FATAL error in main loop: {e}")
-
-        # 5) Sleep until next cycle
-        log(f"Sleeping for {SLEEP_SECONDS} seconds...")
-        time.sleep(SLEEP_SECONDS)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    ensure_directories()
-    log("Starting Crypto-AI-Bot...")
-    main_loop()
