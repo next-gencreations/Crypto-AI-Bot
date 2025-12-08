@@ -1,3 +1,4 @@
+from api_client import send_training_event_to_api
 """
 Crypto-AI-Bot - experimental self-learning paper-trading bot for Coinbase.
 
