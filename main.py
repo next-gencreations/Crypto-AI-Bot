@@ -1,49 +1,40 @@
 from __future__ import annotations
 
 """
-Crypto-AI-Bot - experimental self-learning paper bot.
+Crypto-AI-Bot – experimental self-learning paper bot.
 
-- Public market data only (NO API KEYS, NO REAL MONEY)
-- Scans random markets every 6 minutes
-- Uses simple indicators + per-market win/loss memory
-- Opens multiple long positions
-- Each position has take-profit + stop-loss
-- Logs trades to data/trades.csv
-- Logs equity to data/equity_curve.csv
-- Logs runtime messages to logs/runtime.log
-- Logs feature snapshots to data/training_events.csv
+What this script does:
+
+- Uses ONLY public market data (NO API KEYS, NO REAL MONEY).
+- Scans a randomly chosen subset of markets on a schedule.
+- Opens multiple LONG positions with per-trade TP/SL.
+- Logs:
+    - trades to        data/trades.csv
+    - equity curve to  data/equity_curve.csv
+    - training data to data/training_events.csv
+    - runtime logs to  logs/runtime.log
+- For every closed trade, it sends a training event to the
+  external Crypto-AI-API (via api_client.send_training_event_to_api).
+
+AI “brain” integration:
+
+- Right now, decisions are simple rule-based.
+- The ONLY place you need to modify in the future to plug in a real AI
+  model or your Flask API is the function:
+
+    decide_entry_action(market, price, features, risk_mode)
+
+- Everything else (logging, position management, CSVs, etc.)
+  is already wired up.
 """
 
-from api_client import send_training_event_to_api
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
 
 import os
 import csv
 import time
-import math
-import random
-import logging
-from decimal import Decimal, getcontext
-from datetime import datetime, timezone, date
-from typing import Dict, List, Optional, Tuple
-
-import requests
-- Logs runtime messages to logs/runtime.log
-- Logs feature snapshots to data/training_events.csv
-"""
-
-from api_client import send_training_event_to_api
-
-import os
-import csv
-import time
-import math
-import random
-import logging
-from decimal import Decimal, getcontext
-from datetime import datetime, timezone, date
-from typing import Dict, List, Optional, Tuple
-
-import requests
 import math
 import random
 import logging
@@ -53,14 +44,18 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-# ---------------------------------------------------------------------
-# Precision / global context
-# ---------------------------------------------------------------------
-getcontext().prec = 28  # high precision for crypto prices & PnL
+from api_client import send_training_event_to_api
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Global precision
+# ---------------------------------------------------------------------------
+
+getcontext().prec = 28  # high precision for prices & PnL
+
+# ---------------------------------------------------------------------------
 # Directories & file paths
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
 DATA_DIR = "data"
 LOGS_DIR = "logs"
 
@@ -69,472 +64,473 @@ EQUITY_LOG_PATH = os.path.join(DATA_DIR, "equity_curve.csv")
 TRAINING_LOG_PATH = os.path.join(DATA_DIR, "training_events.csv")
 RUNTIME_LOG_PATH = os.path.join(LOGS_DIR, "runtime.log")
 
-# ---------------------------------------------------------------------
-# Bot parameters
-# ---------------------------------------------------------------------
-START_BALANCE_USD = Decimal("1000")  # starting paper balance
-RISK_MODE = "AGGRESSIVE"             # saved in training events
-
-# Markets to randomly choose from
-ALL_MARKETS: List[str] = [
-    "BTC-USD",
-    "ETH-USD",
-    "ADA-USD",
-    "SOL-USD",
-    "LTC-USD",
-    "AVAX-USD",
-    "LINK-USD",
-    "MATIC-USD",
-    "UNI-USD",
-    "DOGE-USD",
+TRADE_FIELDS = [
+    "timestamp",
+    "market",
+    "direction",
+    "entry_time",
+    "exit_time",
+    "entry_price",
+    "exit_price",
+    "size_usd",
+    "pnl_usd",
+    "pnl_pct",
+    "reason",
 ]
 
-MAX_MARKETS_PER_SCAN = 8
-SLEEP_SECONDS = 6 * 60  # 6 minutes between scans
+EQUITY_FIELDS = [
+    "timestamp",
+    "equity_usd",
+]
 
-# Indicators
-CANDLE_GRANULARITY = 60 * 60  # 1h candles
-LOOKBACK_CANDLES = 100
+TRAINING_FIELDS = [
+    "entry_time",
+    "exit_time",
+    "hold_minutes",
+    "market",
+    "trend_strength",
+    "rsi",
+    "volatility",
+    "entry_price",
+    "exit_price",
+    "pnl_usd",
+    "pnl_pct",
+    "take_profit_pct",
+    "stop_loss_pct",
+    "risk_mode",
+]
 
-MIN_TREND_STRENGTH = 0.20  # simple trend slope filter
-RSI_BUY_MIN = 30           # oversold threshold
+# ---------------------------------------------------------------------------
+# Bot configuration
+# ---------------------------------------------------------------------------
 
-# Public API – you can change this if you like
-# Here we use Coinbase public candles as an example
-PUBLIC_API_BASE = "https://api.exchange.coinbase.com"
+# Equity / sizing
+START_BALANCE_USD = Decimal("1000")
+TRADE_SIZE_USD = Decimal("50")          # notional per trade
+MAX_OPEN_POSITIONS = 5
+
+# Risk mode label (stored in training data so the AI can know “style”)
+RISK_MODE = "AGGRESSIVE"  # or "NORMAL", etc.
+
+# Markets to sample from (Binance spot style symbols)
+ALL_MARKETS: List[str] = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "BNB-USDT",
+    "SOL-USDT",
+    "XRP-USDT",
+    "ADA-USDT",
+    "AVAX-USDT",
+    "LINK-USDT",
+    "ATOM-USDT",
+    "SAND-USDT",
+]
+
+MAX_MARKETS_PER_SCAN = 5        # max markets per cycle
+SLEEP_SECONDS = 60 * 6          # 6 minutes between cycles
+
+# Take-profit / Stop-loss per trade
+TAKE_PROFIT_PCT = Decimal("1.5")  # +1.5%
+STOP_LOSS_PCT = Decimal("1.0")    # -1.0%
+
+# Public market data
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
+
+logger: logging.Logger
+OPEN_POSITIONS: List[Dict] = []
+LAST_PRICE: Dict[str, Decimal] = {}  # for simple feature calculations
 
 
-# ---------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Filesystem & logging utilities
+# ---------------------------------------------------------------------------
+
 def ensure_directories() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
 
 
-def setup_runtime_logger() -> None:
-    logging.basicConfig(
-        filename=RUNTIME_LOG_PATH,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+def setup_logging() -> logging.Logger:
+    log = logging.getLogger("crypto_ai_bot")
+    log.setLevel(logging.INFO)
+
+    if not log.handlers:
+        # File handler
+        fh = logging.FileHandler(RUNTIME_LOG_PATH)
+        fh.setLevel(logging.INFO)
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+
+        # Console handler
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+
+    return log
 
 
-def log_runtime(message: str) -> None:
-    print(message)
-    logging.info(message)
-
-
-def ensure_csv_headers() -> None:
-    """Create CSV files with headers if they don't exist yet."""
-
-    if not os.path.exists(TRADE_LOG_PATH):
-        with open(TRADE_LOG_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "entry_time",
-                    "exit_time",
-                    "market",
-                    "entry_price",
-                    "exit_price",
-                    "size_usd",
-                    "pnl_usd",
-                    "pnl_pct",
-                    "take_profit_pct",
-                    "stop_loss_pct",
-                    "trend_strength",
-                    "rsi",
-                    "volatility",
-                    "risk_mode",
-                ]
-            )
-
-    if not os.path.exists(EQUITY_LOG_PATH):
-        with open(EQUITY_LOG_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time", "equity_usd"])
-
-    if not os.path.exists(TRAINING_LOG_PATH):
-        with open(TRAINING_LOG_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "entry_time",
-                    "exit_time",
-                    "hold_minutes",
-                    "market",
-                    "trend_strength",
-                    "rsi",
-                    "volatility",
-                    "entry_price",
-                    "exit_price",
-                    "pnl_usd",
-                    "pnl_pct",
-                    "take_profit_pct",
-                    "stop_loss_pct",
-                    "risk_mode",
-                ]
-            )
-
-
-# ---------------------------------------------------------------------
-# Data / indicator helpers
-# ---------------------------------------------------------------------
-def get_now() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def fetch_candles(market: str) -> Optional[List[Dict]]:
-    """
-    Fetch OHLCV candles from a public API.
-    Returns list of candles or None on error.
-    Coinbase format: [time, low, high, open, close, volume]
-    """
-    url = f"{PUBLIC_API_BASE}/products/{market}/candles"
-    params = {
-        "granularity": CANDLE_GRANULARITY,
-        "limit": LOOKBACK_CANDLES,
-    }
+def append_csv(path: str, fieldnames: List[str], row: Dict) -> None:
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def load_last_equity() -> Decimal:
+    if not os.path.exists(EQUITY_LOG_PATH):
+        return START_BALANCE_USD
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        with open(EQUITY_LOG_PATH, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            last = None
+            for last in reader:
+                pass
+            if last and "equity_usd" in last:
+                return Decimal(last["equity_usd"])
+    except Exception as exc:
+        logger.error(f"Failed to read equity log, using start balance: {exc}")
+
+    return START_BALANCE_USD
+
+
+def log_equity(equity: Decimal) -> None:
+    append_csv(
+        EQUITY_LOG_PATH,
+        EQUITY_FIELDS,
+        {
+            "timestamp": utc_now().isoformat(),
+            "equity_usd": str(equity),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Market data & features
+# ---------------------------------------------------------------------------
+
+def binance_symbol(market: str) -> str:
+    """Convert 'BTC-USDT' -> 'BTCUSDT'."""
+    return market.replace("-", "")
+
+
+def fetch_price(market: str) -> Optional[Decimal]:
+    symbol = binance_symbol(market)
+    try:
+        resp = requests.get(
+            BINANCE_PRICE_URL,
+            params={"symbol": symbol},
+            timeout=10,
+        )
         resp.raise_for_status()
         data = resp.json()
-        if not isinstance(data, list) or len(data) < 20:
-            return None
-
-        # Sort oldest → newest (Coinbase returns newest first)
-        data.sort(key=lambda x: x[0])
-
-        candles = []
-        for t, low, high, open_, close, vol in data:
-            candles.append(
-                {
-                    "time": datetime.fromtimestamp(t, tz=timezone.utc),
-                    "open": Decimal(str(open_)),
-                    "high": Decimal(str(high)),
-                    "low": Decimal(str(low)),
-                    "close": Decimal(str(close)),
-                    "volume": Decimal(str(vol)),
-                }
-            )
-        return candles
-    except Exception as e:
-        log_runtime(f"[{market}] Error fetching candles: {e}")
+        return Decimal(str(data["price"]))
+    except Exception as exc:
+        logger.error(f"Error fetching price for {market}: {exc}")
         return None
 
 
-def compute_rsi(closes: List[Decimal], period: int = 14) -> Decimal:
-    if len(closes) < period + 1:
-        return Decimal("50")
-
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i - 1]
-        if diff > 0:
-            gains.append(diff)
-        else:
-            losses.append(-diff)
-
-    avg_gain = sum(gains) / Decimal(len(gains) or 1)
-    avg_loss = sum(losses) / Decimal(len(losses) or 1)
-
-    if avg_loss == 0:
-        return Decimal("100")
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def compute_volatility(closes: List[Decimal]) -> Decimal:
-    if len(closes) < 2:
-        return Decimal("0")
-
-    returns = []
-    for i in range(1, len(closes)):
-        if closes[i - 1] == 0:
-            continue
-        r = (closes[i] - closes[i - 1]) / closes[i - 1]
-        returns.append(r)
-
-    if not returns:
-        return Decimal("0")
-
-    mean = sum(returns) / Decimal(len(returns))
-    var = sum((r - mean) ** 2 for r in returns) / Decimal(len(returns))
-    std = var.sqrt()
-    return std
-
-
-def compute_trend_strength(closes: List[Decimal]) -> Decimal:
-    """Very simple trend proxy: slope of last N closes."""
-    n = min(20, len(closes))
-    if n < 5:
-        return Decimal("0")
-
-    xs = list(range(n))
-    ys = [float(c) for c in closes[-n:]]
-
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-
-    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    den = sum((x - mean_x) ** 2 for x in xs) or 1.0
-    slope = num / den
-
-    # Normalise to a rough 0–1 range
-    strength = Decimal(str(math.tanh(slope)))
-    return strength
-
-
-# ---------------------------------------------------------------------
-# Trading logic
-# ---------------------------------------------------------------------
-class Position:
-    def __init__(
-        self,
-        market: str,
-        entry_time: datetime,
-        entry_price: Decimal,
-        size_usd: Decimal,
-        take_profit_pct: Decimal,
-        stop_loss_pct: Decimal,
-        trend_strength: Decimal,
-        rsi: Decimal,
-        volatility: Decimal,
-    ) -> None:
-        self.market = market
-        self.entry_time = entry_time
-        self.entry_price = entry_price
-        self.size_usd = size_usd
-        self.take_profit_pct = take_profit_pct
-        self.stop_loss_pct = stop_loss_pct
-        self.trend_strength = trend_strength
-        self.rsi = rsi
-        self.volatility = volatility
-
-        self.exit_time: Optional[datetime] = None
-        self.exit_price: Optional[Decimal] = None
-        self.pnl_usd: Optional[Decimal] = None
-        self.pnl_pct: Optional[Decimal] = None
-
-    def maybe_close(self, last_price: Decimal) -> bool:
-        """
-        Simple TP/SL logic. Returns True if the position closes this tick.
-        """
-        change_pct = (last_price - self.entry_price) / self.entry_price
-
-        if change_pct >= self.take_profit_pct or change_pct <= -self.stop_loss_pct:
-            self.exit_time = get_now()
-            self.exit_price = last_price
-            self.pnl_pct = change_pct
-            self.pnl_usd = self.size_usd * change_pct
-            return True
-        return False
-
-
-def pick_markets() -> List[str]:
-    count = min(MAX_MARKETS_PER_SCAN, len(ALL_MARKETS))
-    return random.sample(ALL_MARKETS, count)
-
-
-def open_position(
-    market: str,
-    candles: List[Dict],
-    balance_usd: Decimal,
-) -> Optional[Position]:
-    closes = [c["close"] for c in candles]
-    rsi = compute_rsi(closes)
-    trend_strength = compute_trend_strength(closes)
-    volatility = compute_volatility(closes)
-
-    last_price = closes[-1]
-
-    if trend_strength < Decimal(str(MIN_TREND_STRENGTH)):
-        return None
-    if rsi > RSI_BUY_MIN:
-        return None
-
-    # Very simple sizing: 10% of equity
-    size_usd = balance_usd * Decimal("0.10")
-
-    take_profit_pct = Decimal("0.03")  # 3%
-    stop_loss_pct = Decimal("0.015")   # 1.5%
-
-    pos = Position(
-        market=market,
-        entry_time=get_now(),
-        entry_price=last_price,
-        size_usd=size_usd,
-        take_profit_pct=take_profit_pct,
-        stop_loss_pct=stop_loss_pct,
-        trend_strength=trend_strength,
-        rsi=rsi,
-        volatility=volatility,
-    )
-
-    log_runtime(
-        f"[OPEN] {market} @ {last_price} | size ${size_usd} | trend={trend_strength:.3f} RSI={rsi:.1f}"
-    )
-    return pos
-
-
-def log_trade_and_training_event(pos: Position) -> None:
+def compute_features(market: str, price: Decimal) -> Dict[str, float]:
     """
-    Append trade row to trades.csv, training row to training_events.csv,
-    and send the training event to the external API.
+    Very lightweight features derived from last price memory:
+
+    - trend_strength: clipped % change between current & last price
+    - rsi: a fake oscillator based on recent change
+    - volatility: absolute % change (clipped)
     """
-    assert pos.exit_time is not None
-    assert pos.exit_price is not None
-    assert pos.pnl_usd is not None
-    assert pos.pnl_pct is not None
+    prev = LAST_PRICE.get(market, price)
+    LAST_PRICE[market] = price
 
-    entry_time_str = pos.entry_time.isoformat()
-    exit_time_str = pos.exit_time.isoformat()
-    hold_minutes = (pos.exit_time - pos.entry_time).total_seconds() / 60.0
+    if prev <= 0:
+        change_pct = Decimal("0")
+    else:
+        change_pct = (price - prev) / prev * Decimal("100")
 
-    # 1) Log trades.csv
-    with open(TRADE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                entry_time_str,
-                exit_time_str,
-                pos.market,
-                f"{pos.entry_price:f}",
-                f"{pos.exit_price:f}",
-                f"{pos.size_usd:f}",
-                f"{pos.pnl_usd:f}",
-                f"{pos.pnl_pct:f}",
-                f"{pos.take_profit_pct:f}",
-                f"{pos.stop_loss_pct:f}",
-                f"{pos.trend_strength:f}",
-                f"{pos.rsi:f}",
-                f"{pos.volatility:f}",
-                RISK_MODE,
-            ]
-        )
+    # Clip trend strength to [-5, 5]
+    trend_strength = float(max(Decimal("-5"), min(Decimal("5"), change_pct)))
 
-    # 2) Build training event dict
-    event = {
-        "entry_time": entry_time_str,
-        "exit_time": exit_time_str,
-        "hold_minutes": round(hold_minutes, 2),
-        "market": pos.market,
-        "trend_strength": float(pos.trend_strength),
-        "rsi": float(pos.rsi),
-        "volatility": float(pos.volatility),
-        "entry_price": float(pos.entry_price),
-        "exit_price": float(pos.exit_price),
-        "pnl_usd": float(pos.pnl_usd),
-        "pnl_pct": float(pos.pnl_pct),
-        "take_profit_pct": float(pos.take_profit_pct),
-        "stop_loss_pct": float(pos.stop_loss_pct),
-        "risk_mode": RISK_MODE,
+    # Pseudo-RSI: start from 50 and push by 2x change
+    rsi_base = 50 + float(change_pct) * 2
+    rsi = max(0.0, min(100.0, rsi_base))
+
+    volatility = float(min(10, abs(float(change_pct))))
+
+    return {
+        "trend_strength": trend_strength,
+        "rsi": rsi,
+        "volatility": volatility,
     }
 
-    # 3) Append to training_events.csv
-    with open(TRAINING_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                event["entry_time"],
-                event["exit_time"],
-                event["hold_minutes"],
-                event["market"],
-                event["trend_strength"],
-                event["rsi"],
-                event["volatility"],
-                event["entry_price"],
-                event["exit_price"],
-                event["pnl_usd"],
-                event["pnl_pct"],
-                event["take_profit_pct"],
-                event["stop_loss_pct"],
-                event["risk_mode"],
-            ]
-        )
 
-    # 4) Send to external API (non-blocking for the bot)
+# ---------------------------------------------------------------------------
+# Strategy / AI decision layer
+# ---------------------------------------------------------------------------
+
+def decide_entry_action(
+    market: str,
+    price: Decimal,
+    features: Dict[str, float],
+    risk_mode: str,
+) -> bool:
+    """
+    ENTRY decision function.
+
+    RETURN:
+        True  -> open LONG
+        False -> do nothing
+
+    CURRENT LOGIC (simple baseline):
+    - Go long when trend_strength > 0 and rsi < 70
+    - Later, you can replace this with:
+        - a call to your Crypto-AI-API (e.g. /signal)
+        - a local ML model
+        - any custom AI logic
+
+    This way, all other code (logging, positions, files) stays unchanged.
+    """
+    trend = features["trend_strength"]
+    rsi = features["rsi"]
+
+    # Example of very simple rule that depends on "risk_mode"
+    if risk_mode == "AGGRESSIVE":
+        min_trend = 0.05
+        max_rsi = 75
+    else:  # NORMAL / conservative
+        min_trend = 0.2
+        max_rsi = 70
+
+    if trend > min_trend and rsi < max_rsi:
+        return True
+
+    return False
+
+
+def can_open_more_positions() -> bool:
+    return len(OPEN_POSITIONS) < MAX_OPEN_POSITIONS
+
+
+# ---------------------------------------------------------------------------
+# Positions: open / evaluate / close
+# ---------------------------------------------------------------------------
+
+def open_position(market: str, price: Decimal, features: Dict[str, float]) -> None:
+    if not can_open_more_positions():
+        return
+
+    position = {
+        "market": market,
+        "direction": "LONG",
+        "entry_time": utc_now(),
+        "entry_price": price,
+        "size_usd": TRADE_SIZE_USD,
+        "take_profit_pct": TAKE_PROFIT_PCT,
+        "stop_loss_pct": STOP_LOSS_PCT,
+        "features": features,  # snapshot at entry
+    }
+
+    OPEN_POSITIONS.append(position)
+    logger.info(f"Opened LONG {market} at {price} size {TRADE_SIZE_USD} USD")
+
+
+def evaluate_exit(
+    position: Dict,
+    current_price: Decimal,
+) -> Tuple[bool, Optional[str], Decimal, Decimal]:
+    """
+    EXIT decision function.
+
+    Currently only uses TP/SL. Later you can make this more “AI-ish”
+    if you like, similar to decide_entry_action.
+    """
+    entry_price: Decimal = position["entry_price"]
+    size_usd: Decimal = position["size_usd"]
+
+    if entry_price <= 0:
+        return False, None, Decimal("0"), Decimal("0")
+
+    change_pct = (current_price - entry_price) / entry_price * Decimal("100")
+
+    # Take-profit?
+    if change_pct >= position["take_profit_pct"]:
+        pnl_pct = change_pct
+        pnl_usd = size_usd * pnl_pct / Decimal("100")
+        return True, "TAKE_PROFIT", pnl_usd, pnl_pct
+
+    # Stop-loss?
+    if change_pct <= -position["stop_loss_pct"]:
+        pnl_pct = change_pct
+        pnl_usd = size_usd * pnl_pct / Decimal("100")
+        return True, "STOP_LOSS", pnl_usd, pnl_pct
+
+    return False, None, Decimal("0"), Decimal("0")
+
+
+def close_position(
+    position: Dict,
+    current_price: Decimal,
+    reason: str,
+    pnl_usd: Decimal,
+    pnl_pct: Decimal,
+    equity_before: Decimal,
+) -> Decimal:
+    """
+    Close a position, log everything, send training event, return new equity.
+    """
+    global OPEN_POSITIONS
+
+    market = position["market"]
+    entry_time: datetime = position["entry_time"]
+    entry_price: Decimal = position["entry_price"]
+    size_usd: Decimal = position["size_usd"]
+    features = position["features"]
+
+    exit_time = utc_now()
+    hold_minutes = (exit_time - entry_time).total_seconds() / 60.0
+
+    # Remove from open list
+    OPEN_POSITIONS = [p for p in OPEN_POSITIONS if p is not position]
+
+    # 1) Log trade
+    trade_row = {
+        "timestamp": exit_time.isoformat(),
+        "market": market,
+        "direction": "LONG",
+        "entry_time": entry_time.isoformat(),
+        "exit_time": exit_time.isoformat(),
+        "entry_price": str(entry_price),
+        "exit_price": str(current_price),
+        "size_usd": str(size_usd),
+        "pnl_usd": str(pnl_usd),
+        "pnl_pct": str(pnl_pct),
+        "reason": reason,
+    }
+    append_csv(TRADE_LOG_PATH, TRADE_FIELDS, trade_row)
+
+    # 2) Log training event
+    training_row = {
+        "entry_time": entry_time.isoformat(),
+        "exit_time": exit_time.isoformat(),
+        "hold_minutes": round(hold_minutes, 2),
+        "market": market,
+        "trend_strength": features["trend_strength"],
+        "rsi": features["rsi"],
+        "volatility": features["volatility"],
+        "entry_price": str(entry_price),
+        "exit_price": str(current_price),
+        "pnl_usd": str(pnl_usd),
+        "pnl_pct": str(pnl_pct),
+        "take_profit_pct": str(position["take_profit_pct"]),
+        "stop_loss_pct": str(position["stop_loss_pct"]),
+        "risk_mode": RISK_MODE,
+    }
+    append_csv(TRAINING_LOG_PATH, TRAINING_FIELDS, training_row)
+
+    # Send to external Crypto-AI-API for learning
     try:
-        send_training_event_to_api(event)
-    except Exception as e:
-        log_runtime(f"[WARN] Failed to send training event to API: {e}")
+        send_training_event_to_api(training_row)
+    except Exception as exc:
+        logger.error(f"Failed to send training event to API: {exc}")
+
+    # 3) Update equity
+    new_equity = equity_before + pnl_usd
+    logger.info(
+        f"Closed {market} {reason} at {current_price} PnL {pnl_usd:.2f} USD "
+        f"({pnl_pct:.2f}%), equity: {equity_before:.2f} -> {new_equity:.2f}"
+    )
+    log_equity(new_equity)
+    return new_equity
 
 
-def log_equity(equity_usd: Decimal) -> None:
-    with open(EQUITY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([get_now().isoformat(), f"{equity_usd:f}"])
+# ---------------------------------------------------------------------------
+# One full cycle: scan markets + manage positions
+# ---------------------------------------------------------------------------
+
+def choose_markets_for_cycle() -> List[str]:
+    """Pick a random subset of markets to scan this round."""
+    return random.sample(
+        ALL_MARKETS,
+        k=min(MAX_MARKETS_PER_SCAN, len(ALL_MARKETS)),
+    )
 
 
-# ---------------------------------------------------------------------
+def scan_markets_and_trade(equity: Decimal) -> Decimal:
+    """
+    One cycle:
+      - Pick markets
+      - Get price + features
+      - Decide entries
+      - Update / close open positions
+    """
+    # 1) Entry scanning
+    for market in choose_markets_for_cycle():
+        price = fetch_price(market)
+        if price is None:
+            continue
+
+        features = compute_features(market, price)
+
+        if can_open_more_positions():
+            want_entry = decide_entry_action(
+                market=market,
+                price=price,
+                features=features,
+                risk_mode=RISK_MODE,
+            )
+            if want_entry:
+                open_position(market, price, features)
+
+    # 2) Exit check for all open positions
+    for position in list(OPEN_POSITIONS):
+        market = position["market"]
+        price = fetch_price(market)
+        if price is None:
+            continue
+
+        should_close, reason, pnl_usd, pnl_pct = evaluate_exit(position, price)
+        if should_close:
+            equity = close_position(position, price, reason, pnl_usd, pnl_pct, equity)
+
+    return equity
+
+
+# ---------------------------------------------------------------------------
 # Main loop
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     ensure_directories()
-    setup_runtime_logger()
-    ensure_csv_headers()
+    global logger
+    logger = setup_logging()
 
-    balance_usd = START_BALANCE_USD
-    open_positions: Dict[str, Position] = {}
+    logger.info("Crypto-AI-Bot starting up")
 
-    log_runtime("==== Crypto-AI-Bot starting ====")
-    log_runtime(f"Start balance: ${balance_usd}")
+    equity = load_last_equity()
+    logger.info(f"Loaded starting equity: {equity:.2f} USD")
+    log_equity(equity)
 
     while True:
         try:
-            markets = pick_markets()
-            log_runtime(f"Scanning {len(markets)} markets: {', '.join(markets)}")
+            equity = scan_markets_and_trade(equity)
+        except Exception as exc:
+            logger.exception(f"Unhandled error in main loop: {exc}")
 
-            # 1) Update/close existing positions with latest prices
-            for market, pos in list(open_positions.items()):
-                candles = fetch_candles(market)
-                if not candles:
-                    continue
-
-                last_price = candles[-1]["close"]
-                if pos.maybe_close(last_price):
-                    # Update balance
-                    assert pos.pnl_usd is not None
-                    balance_usd += pos.pnl_usd
-                    log_runtime(
-                        f"[CLOSE] {market} @ {pos.exit_price} | "
-                        f"PnL ${pos.pnl_usd:.2f} ({pos.pnl_pct:.2%}) | "
-                        f"Equity ${balance_usd:.2f}"
-                    )
-                    log_trade_and_training_event(pos)
-                    del open_positions[market]
-
-            # 2) Try to open new positions on random markets
-            for market in markets:
-                if market in open_positions:
-                    continue
-
-                candles = fetch_candles(market)
-                if not candles:
-                    continue
-
-                pos = open_position(market, candles, balance_usd)
-                if pos:
-                    open_positions[market] = pos
-
-            # 3) Log equity
-            log_equity(balance_usd)
-
-            # 4) Sleep before next cycle
-            log_runtime(
-                f"Cycle complete – positions={len(open_positions)}, equity=${balance_usd:.2f}. "
-                f"Sleeping {SLEEP_SECONDS} seconds..."
-            )
-            time.sleep(SLEEP_SECONDS)
-
-        except Exception as e:
-            log_runtime(f"[ERROR] Main loop crashed: {e}")
-            time.sleep(10)
+        logger.info(f"Sleeping for {SLEEP_SECONDS} seconds...")
+        time.sleep(SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
