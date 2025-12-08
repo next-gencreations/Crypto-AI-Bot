@@ -1,5 +1,4 @@
-from api_client import send_training_event_to_api
-"""
+
 from __future__ import annotations
 
 from api_client import send_training_event_to_api
