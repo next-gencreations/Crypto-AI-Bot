@@ -1,7 +1,4 @@
-
 from __future__ import annotations
-
-from api_client import send_training_event_to_api
 
 """
 Crypto-AI-Bot - experimental self-learning paper bot.
@@ -17,11 +14,36 @@ Crypto-AI-Bot - experimental self-learning paper bot.
 - Logs feature snapshots to data/training_events.csv
 """
 
-from __future__ import annotations
+from api_client import send_training_event_to_api
 
 import os
 import csv
 import time
+import math
+import random
+import logging
+from decimal import Decimal, getcontext
+from datetime import datetime, timezone, date
+from typing import Dict, List, Optional, Tuple
+
+import requests
+- Logs runtime messages to logs/runtime.log
+- Logs feature snapshots to data/training_events.csv
+"""
+
+from api_client import send_training_event_to_api
+
+import os
+import csv
+import time
+import math
+import random
+import logging
+from decimal import Decimal, getcontext
+from datetime import datetime, timezone, date
+from typing import Dict, List, Optional, Tuple
+
+import requests
 import math
 import random
 import logging
