@@ -1,2 +1,7 @@
+pandas
+python-binance
 requests
-python-dotenv
+# add any other libraries your bot already uses:
+# numpy
+# TA-Lib
+# etc.
