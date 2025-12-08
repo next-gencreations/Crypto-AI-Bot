@@ -1,14 +1,21 @@
 from api_client import send_training_event_to_api
 """
-Crypto-AI-Bot – experimental self-learning paper trading bot
+from __future__ import annotations
 
-- Uses ONLY public market data (no API keys, no real money)
-- Scans random markets every few minutes
-- Opens simple long positions based on trend/RSI
+from api_client import send_training_event_to_api
+
+"""
+Crypto-AI-Bot - experimental self-learning paper bot.
+
+- Public market data only (NO API KEYS, NO REAL MONEY)
+- Scans random markets every 6 minutes
+- Uses simple indicators + per-market win/loss memory
+- Opens multiple long positions
+- Each position has take-profit + stop-loss
 - Logs trades to data/trades.csv
-- Logs equity curve to data/equity_curve.csv
-- Logs training events to data/training_events.csv
-- Sends each training event to the Crypto-AI-API for learning
+- Logs equity to data/equity_curve.csv
+- Logs runtime messages to logs/runtime.log
+- Logs feature snapshots to data/training_events.csv
 """
 
 from __future__ import annotations
