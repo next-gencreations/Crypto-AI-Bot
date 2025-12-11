@@ -225,25 +225,29 @@ def send_training_event_to_api(row: Dict[str, Any]) -> None:
 # Market data + position logic
 # ---------------------------------------------------------------------------
 
-def fetch_price(symbol: str) -> Optional[Decimal]:
+def fetch_price(symbol: str) -> Decimal | None:
     """
-    Fetch the latest price from Binance (USDT pairs).
-    Returns a Decimal or None on failure.
+    Fetch latest price from Binance API with required headers.
+    Binance returns 451 errors if no User-Agent header is included.
     """
-    ticker = BINANCE_SYMBOL_MAP.get(symbol.upper())
-    if not ticker:
-        logging.error(f"[PRICE] No Binance mapping for symbol {symbol}")
-        return None
 
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}"
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; CryptoBot/1.0; +https://yourdomain.com)"
+    }
+
     try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+
+        data = response.json()
+
         price = Decimal(data["price"])
         return price
+
     except Exception as e:
-        logging.error(f"[PRICE] Failed to fetch {symbol} price: {e}")
+        logging.error(f"[PRICE] Error fetching {symbol}: {e}")
         return None
 
 
