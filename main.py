@@ -171,10 +171,24 @@ class BotState:
                 elif "symbol" in p and isinstance(p["symbol"], str):
                     p["market"] = p.pop("symbol")
                     normalized.append(p)
+    def normalize_positions(self) -> None:
+    """
+    Make sure open_positions is a list of dicts with at least a 'market' key.
+    If older state stored positions as strings, drop them (legacy/invalid).
+    """
+    normalized: List[Dict[str, Any]] = []
+    for p in self.open_positions:
+        if isinstance(p, dict):
+            if "market" in p and isinstance(p["market"], str):
+                normalized.append(p)
+            elif "symbol" in p and isinstance(p["symbol"], str):
+                p["market"] = p.pop("symbol")
+                normalized.append(p)
         elif isinstance(p, str):
-    # Old/invalid legacy entry (string market) — drop it.
-    continue
-        self.open_positions = normalized
+            # Old/invalid legacy entry (string market) — drop it.
+            continue
+
+    self.open_positions = normalized
 
     def to_json(self) -> Dict[str, Any]:
         self.normalize_positions()
