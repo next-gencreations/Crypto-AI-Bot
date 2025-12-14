@@ -37,10 +37,16 @@ EQUITY_CSV = os.path.join(DATA_DIR, "equity_curve.csv")
 TRAINING_FILE = os.path.join(DATA_DIR, "training_events.csv")  # optional
 
 DEFAULT_MARKETS = ["BTC-USD", "ETH-USD", "LTC-USD", "BCH-USD", "SOL-USD", "ADA-USD"]
-MARKETS = [m.strip() for m in os.environ.get("MARKETS", ",".join(DEFAULT_MARKETS)).split(",") if m.strip()]
+MARKETS = [
+    m.strip()
+    for m in os.environ.get("MARKETS", ",".join(DEFAULT_MARKETS)).split(",")
+    if m.strip()
+]
 
 START_EQUITY = float(os.environ.get("START_EQUITY", "1000"))
-CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "60"))
+
+# Default to 6-minute cycle (can override via env)
+CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "360"))
 
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "2"))
 POSITION_USD = float(os.environ.get("POSITION_USD", "100"))
@@ -49,10 +55,12 @@ TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "3.0"))
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "2.0"))
 MAX_HOLD_MINUTES = int(os.environ.get("MAX_HOLD_MINUTES", "180"))
 
+# Probability of opening a trade *per market per cycle* (only when under max positions)
 ENTRY_CHANCE = float(os.environ.get("ENTRY_CHANCE", "0.06"))
 RISK_MODE = os.environ.get("RISK_MODE", "normal")
 
-# IMPORTANT: This must be set in the WORKER environment variables
+# IMPORTANT: set API_URL in the WORKER environment variables (Render)
+# Example: https://crypto-ai-api-xxxx.onrender.com
 API_URL = os.environ.get("API_URL", "").strip().rstrip("/")
 API_KEY = os.environ.get("API_KEY", "").strip()
 
@@ -102,7 +110,7 @@ def _append_csv_row(path: str, row: List[Any]) -> None:
 
 
 # ---------------------------
-# API Push (THIS IS THE DASHBOARD FIX)
+# API Push (worker -> crypto-ai-api)
 # ---------------------------
 def _api_headers() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
@@ -112,13 +120,12 @@ def _api_headers() -> Dict[str, str]:
 
 
 def api_post(path: str, payload: Dict[str, Any]) -> bool:
-    """Post payload to your crypto-ai-api service. Returns True if success."""
     if not API_URL or requests is None:
         return False
     try:
         url = f"{API_URL}{path}"
         r = requests.post(url, json=payload, headers=_api_headers(), timeout=10)
-        if r.status_code >= 200 and r.status_code < 300:
+        if 200 <= r.status_code < 300:
             return True
         log.warning(f"API POST failed {r.status_code}: {r.text[:200]}")
         return False
@@ -131,8 +138,12 @@ def push_heartbeat(payload: Dict[str, Any]) -> None:
     api_post("/ingest/heartbeat", payload)
 
 
-def push_trade(row: Dict[str, Any]) -> None:
-    api_post("/ingest/trade", row)
+def push_trade(payload: Dict[str, Any]) -> None:
+    api_post("/ingest/trade", payload)
+
+
+def push_equity(payload: Dict[str, Any]) -> None:
+    api_post("/ingest/equity", payload)
 
 
 # ---------------------------
@@ -155,13 +166,13 @@ class Position:
 @dataclass
 class BotState:
     equity_usd: float = START_EQUITY
-    # NOTE: keep compatibility: could contain dicts OR old string markets
+    # Can contain dicts OR legacy strings (older bad state)
     open_positions: List[Union[Dict[str, Any], str]] = field(default_factory=list)
 
     def normalize_positions(self) -> None:
         """
-        Make sure open_positions is a list of dicts with at least a 'market' key.
-        If older state stored positions as strings, convert them safely.
+        Ensure open_positions is a list of dicts with at least a 'market' key.
+        Legacy string entries are DROPPED (they caused ghost positions with entry_price=0).
         """
         normalized: List[Dict[str, Any]] = []
         for p in self.open_positions:
@@ -171,24 +182,11 @@ class BotState:
                 elif "symbol" in p and isinstance(p["symbol"], str):
                     p["market"] = p.pop("symbol")
                     normalized.append(p)
-    def normalize_positions(self) -> None:
-    """
-    Make sure open_positions is a list of dicts with at least a 'market' key.
-    If older state stored positions as strings, drop them (legacy/invalid).
-    """
-    normalized: List[Dict[str, Any]] = []
-    for p in self.open_positions:
-        if isinstance(p, dict):
-            if "market" in p and isinstance(p["market"], str):
-                normalized.append(p)
-            elif "symbol" in p and isinstance(p["symbol"], str):
-                p["market"] = p.pop("symbol")
-                normalized.append(p)
-        elif isinstance(p, str):
-            # Old/invalid legacy entry (string market) — drop it.
-            continue
+            elif isinstance(p, str):
+                # Drop legacy/invalid entries (string-only markets)
+                continue
 
-    self.open_positions = normalized
+        self.open_positions = normalized
 
     def to_json(self) -> Dict[str, Any]:
         self.normalize_positions()
@@ -232,10 +230,6 @@ def save_state(state: BotState) -> None:
 # Heartbeat
 # ---------------------------
 def write_heartbeat(state: BotState, status: str, note: str = "") -> Dict[str, Any]:
-    """
-    Writes local data/heartbeat.json and also RETURNS the payload.
-    We then POST this payload to the API (crypto-ai-api) so the dashboard updates.
-    """
     ensure_data_dir()
     state.normalize_positions()
 
@@ -244,8 +238,7 @@ def write_heartbeat(state: BotState, status: str, note: str = "") -> Dict[str, A
         "status": status,
         "note": note,
         "equity_usd": float(state.equity_usd),
-        # robust for dict positions
-        "open_positions": [p["market"] if isinstance(p, dict) else str(p) for p in state.open_positions],
+        "open_positions": [p.get("market") for p in state.open_positions if isinstance(p, dict)],
     }
 
     tmp = HEARTBEAT_JSON + ".tmp"
@@ -256,18 +249,22 @@ def write_heartbeat(state: BotState, status: str, note: str = "") -> Dict[str, A
     with open(HEARTBEAT_TXT, "w", encoding="utf-8") as f:
         f.write(f"{payload['time_utc']} | {status} | equity={payload['equity_usd']}\n")
 
-    # DASHBOARD FIX: push to API
+    # push to dashboard API
     push_heartbeat(payload)
 
     return payload
 
 
 # ---------------------------
-# CSV outputs
+# CSV outputs + API push
 # ---------------------------
 def record_equity(equity_usd: float) -> None:
-    _ensure_csv_header(EQUITY_CSV, ["time", "equity_usd"])
-    _append_csv_row(EQUITY_CSV, [now_utc_iso(), float(equity_usd)])
+    _ensure_csv_header(EQUITY_CSV, ["time_utc", "equity_usd"])
+    payload = {"time_utc": now_utc_iso(), "equity_usd": float(equity_usd)}
+    _append_csv_row(EQUITY_CSV, [payload["time_utc"], payload["equity_usd"]])
+
+    # push to dashboard API (so equity curve renders)
+    push_equity(payload)
 
 
 def record_trade(row: Dict[str, Any]) -> None:
@@ -313,7 +310,7 @@ def record_trade(row: Dict[str, Any]) -> None:
         ],
     )
 
-    # DASHBOARD FIX: push to API
+    # push to dashboard API
     push_trade(row)
 
 
@@ -438,7 +435,7 @@ def main() -> None:
     state = load_state()
     state.normalize_positions()
 
-    _ensure_csv_header(EQUITY_CSV, ["time", "equity_usd"])
+    _ensure_csv_header(EQUITY_CSV, ["time_utc", "equity_usd"])
     _ensure_csv_header(
         TRADES_CSV,
         [
@@ -459,16 +456,16 @@ def main() -> None:
             "volatility",
         ],
     )
-    if not os.path.exists(TRAINING_FILE):
-        _ensure_csv_header(TRAINING_FILE, ["time_utc", "event", "detail"])
+    _ensure_csv_header(TRAINING_FILE, ["time_utc", "event", "details"])
 
     log.info("Crypto-AI-Bot running (paper trading, Coinbase prices)")
     log.info(f"DATA_DIR={DATA_DIR}")
     log.info(f"Markets={MARKETS}")
+    log.info(f"Cycle seconds={CYCLE_SECONDS}")
     log.info(f"API_URL={API_URL if API_URL else '(none)'} API_KEY={'(set)' if API_KEY else '(disabled)'}")
     log.info(f"Equity=${state.equity_usd:.2f}")
 
-    # Boot heartbeat (stops 'heartbeat not found')
+    # Boot
     write_heartbeat(state, "running", note="boot")
     record_equity(state.equity_usd)
     save_state(state)
@@ -483,10 +480,7 @@ def main() -> None:
             still_open: List[Dict[str, Any]] = []
             for p in state.open_positions:
                 if not isinstance(p, dict):
-                    still_open.append(
-                        {"market": str(p), "entry_time": now_utc_iso(), "entry_price": 0.0, "qty": 0.0}
-                    )
-                    continue
+                    continue  # should never happen after normalize_positions()
 
                 m = p.get("market")
                 if not m or m not in prices:
