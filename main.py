@@ -171,18 +171,9 @@ class BotState:
                 elif "symbol" in p and isinstance(p["symbol"], str):
                     p["market"] = p.pop("symbol")
                     normalized.append(p)
-            elif isinstance(p, str):
-                normalized.append(
-                    {
-                        "market": p,
-                        "entry_time": now_utc_iso(),
-                        "entry_price": 0.0,
-                        "qty": 0.0,
-                        "take_profit_pct": TAKE_PROFIT_PCT,
-                        "stop_loss_pct": STOP_LOSS_PCT,
-                        "risk_mode": RISK_MODE,
-                    }
-                )
+        elif isinstance(p, str):
+    # Old/invalid legacy entry (string market) — drop it.
+    continue
         self.open_positions = normalized
 
     def to_json(self) -> Dict[str, Any]:
