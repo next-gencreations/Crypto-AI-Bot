@@ -1,530 +1,377 @@
+# main.py
 import os
-import csv
-import json
 import time
-import random
-import logging
-from dataclasses import dataclass, asdict, field
+import uuid
+import math
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
 
-try:
-    import requests
-except Exception:
-    requests = None  # requirements.txt should include it on Render
+from event_logger import BotLogger
 
-
-# ---------------------------
-# Logging
-# ---------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("crypto-ai-bot")
+# If your repo already has api_client.py, we import it.
+# We'll call ApiClient.get_candles() inside the adapter function below.
+from api_client import ApiClient
 
 
-# ---------------------------
-# Paths / Config
-# ---------------------------
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
-
-BOT_STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
-HEARTBEAT_JSON = os.path.join(DATA_DIR, "heartbeat.json")
-HEARTBEAT_TXT = os.path.join(DATA_DIR, "heartbeat.txt")
-TRADES_CSV = os.path.join(DATA_DIR, "trades.csv")
-EQUITY_CSV = os.path.join(DATA_DIR, "equity_curve.csv")
-TRAINING_FILE = os.path.join(DATA_DIR, "training_events.csv")  # optional
-
-DEFAULT_MARKETS = ["BTC-USD", "ETH-USD", "LTC-USD", "BCH-USD", "SOL-USD", "ADA-USD"]
-MARKETS = [
-    m.strip()
-    for m in os.environ.get("MARKETS", ",".join(DEFAULT_MARKETS)).split(",")
-    if m.strip()
-]
-
-START_EQUITY = float(os.environ.get("START_EQUITY", "1000"))
-
-# Default to 6-minute cycle (can override via env)
-CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "360"))
-
-MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "2"))
-POSITION_USD = float(os.environ.get("POSITION_USD", "100"))
-
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "3.0"))
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "2.0"))
-MAX_HOLD_MINUTES = int(os.environ.get("MAX_HOLD_MINUTES", "180"))
-
-# Probability of opening a trade *per market per cycle* (only when under max positions)
-ENTRY_CHANCE = float(os.environ.get("ENTRY_CHANCE", "0.06"))
-RISK_MODE = os.environ.get("RISK_MODE", "normal")
-
-# IMPORTANT: set API_URL in the WORKER environment variables (Render)
-# Example: https://crypto-ai-api-xxxx.onrender.com
-API_URL = os.environ.get("API_URL", "").strip().rstrip("/")
-API_KEY = os.environ.get("API_KEY", "").strip()
-
-COINBASE_SPOT = "https://api.coinbase.com/v2/prices/{symbol}/spot"
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def now_utc_iso() -> str:
+# ----------------------------
+# Helpers (indicators)
+# ----------------------------
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+def ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = (v * k) + (e * (1 - k))
+    return e
 
 
-def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+def rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+    gains = 0.0
+    losses = 0.0
+    for i in range(-period, 0):
+        change = closes[i] - closes[i - 1]
+        if change > 0:
+            gains += change
+        else:
+            losses += abs(change)
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
+
+
+def safe_float(x, default=None):
     try:
-        if x is None:
-            return default
         return float(x)
     except Exception:
         return default
 
 
-def _minutes_between(iso_a: str, iso_b: str) -> float:
-    try:
-        a = datetime.fromisoformat(iso_a.replace("Z", "+00:00"))
-        b = datetime.fromisoformat(iso_b.replace("Z", "+00:00"))
-        return (b - a).total_seconds() / 60.0
-    except Exception:
-        return 0.0
+# ----------------------------
+# Adapter: get candle closes
+# ----------------------------
+def fetch_candles_closes(client: ApiClient, market: str, granularity_sec: int, limit: int) -> List[float]:
+    """
+    EXPECTATION:
+    Your api_client.py should provide something like:
+      client.get_candles(product_id=market, granularity=granularity_sec, limit=limit)
+    returning candles with close prices.
 
+    Because I can’t see your exact function signature, this adapter tries common patterns.
 
-def _ensure_csv_header(path: str, header: List[str]) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(header)
+    If this fails, scroll down to 'IF YOU GET AN ERROR HERE' for the 2-line fix.
+    """
 
+    # Try common method names/signatures:
+    candles = None
 
-def _append_csv_row(path: str, row: List[Any]) -> None:
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(row)
+    # 1) get_candles(product_id=..., granularity=..., limit=...)
+    if candles is None and hasattr(client, "get_candles"):
+        try:
+            candles = client.get_candles(product_id=market, granularity=granularity_sec, limit=limit)
+        except TypeError:
+            pass
+        except Exception:
+            pass
 
+    # 2) get_candles(market, granularity_sec, limit)
+    if candles is None and hasattr(client, "get_candles"):
+        try:
+            candles = client.get_candles(market, granularity_sec, limit)
+        except Exception:
+            pass
 
-# ---------------------------
-# API Push (worker -> crypto-ai-api)
-# ---------------------------
-def _api_headers() -> Dict[str, str]:
-    h = {"Content-Type": "application/json"}
-    if API_KEY:
-        h["X-API-KEY"] = API_KEY
-    return h
+    # 3) fetch_candles(...)
+    if candles is None and hasattr(client, "fetch_candles"):
+        try:
+            candles = client.fetch_candles(market, granularity_sec, limit)
+        except Exception:
+            pass
 
-
-def api_post(path: str, payload: Dict[str, Any]) -> bool:
-    if not API_URL or requests is None:
-        return False
-    try:
-        url = f"{API_URL}{path}"
-        r = requests.post(url, json=payload, headers=_api_headers(), timeout=10)
-        if 200 <= r.status_code < 300:
-            return True
-        log.warning(f"API POST failed {r.status_code}: {r.text[:200]}")
-        return False
-    except Exception as e:
-        log.warning(f"API POST exception: {e}")
-        return False
-
-
-def push_heartbeat(payload: Dict[str, Any]) -> None:
-    api_post("/ingest/heartbeat", payload)
-
-
-def push_trade(payload: Dict[str, Any]) -> None:
-    api_post("/ingest/trade", payload)
-
-
-def push_equity(payload: Dict[str, Any]) -> None:
-    api_post("/ingest/equity", payload)
-
-
-# ---------------------------
-# State
-# ---------------------------
-@dataclass
-class Position:
-    market: str
-    entry_time: str
-    entry_price: float
-    qty: float
-    take_profit_pct: float = TAKE_PROFIT_PCT
-    stop_loss_pct: float = STOP_LOSS_PCT
-    risk_mode: str = RISK_MODE
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class BotState:
-    equity_usd: float = START_EQUITY
-    # Can contain dicts OR legacy strings (older bad state)
-    open_positions: List[Union[Dict[str, Any], str]] = field(default_factory=list)
-
-    def normalize_positions(self) -> None:
-        """
-        Ensure open_positions is a list of dicts with at least a 'market' key.
-        Legacy string entries are DROPPED (they caused ghost positions with entry_price=0).
-        """
-        normalized: List[Dict[str, Any]] = []
-        for p in self.open_positions:
-            if isinstance(p, dict):
-                if "market" in p and isinstance(p["market"], str):
-                    normalized.append(p)
-                elif "symbol" in p and isinstance(p["symbol"], str):
-                    p["market"] = p.pop("symbol")
-                    normalized.append(p)
-            elif isinstance(p, str):
-                # Drop legacy/invalid entries (string-only markets)
-                continue
-
-        self.open_positions = normalized
-
-    def to_json(self) -> Dict[str, Any]:
-        self.normalize_positions()
-        return {
-            "equity_usd": float(self.equity_usd),
-            "open_positions": self.open_positions,
-        }
-
-    @staticmethod
-    def from_json(d: Dict[str, Any]) -> "BotState":
-        s = BotState(
-            equity_usd=_safe_float(d.get("equity_usd"), START_EQUITY) or START_EQUITY,
-            open_positions=d.get("open_positions") or [],
+    if candles is None:
+        raise RuntimeError(
+            "Could not fetch candles. Your api_client.py does not match the expected get_candles()/fetch_candles() patterns."
         )
-        s.normalize_positions()
-        return s
+
+    # Normalize candles → list of closes
+    closes: List[float] = []
+
+    # If candles are list of dicts
+    if isinstance(candles, list) and candles and isinstance(candles[0], dict):
+        # common keys: "close", "c"
+        for c in candles[-limit:]:
+            close = c.get("close", c.get("c"))
+            if close is not None:
+                closes.append(float(close))
+
+    # If candles are list of lists like [time, low, high, open, close, volume]
+    elif isinstance(candles, list) and candles and isinstance(candles[0], (list, tuple)):
+        for row in candles[-limit:]:
+            if len(row) >= 5:
+                closes.append(float(row[4]))
+
+    # If candles are something else, try last resort
+    if not closes:
+        # Try attribute access
+        try:
+            for c in candles[-limit:]:
+                closes.append(float(getattr(c, "close")))
+        except Exception:
+            pass
+
+    if not closes:
+        raise RuntimeError("Fetched candles but could not parse close prices.")
+
+    return closes
 
 
-def load_state() -> BotState:
-    ensure_data_dir()
-    if not os.path.exists(BOT_STATE_FILE):
-        return BotState()
-    try:
-        with open(BOT_STATE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return BotState.from_json(d)
-    except Exception as e:
-        log.warning(f"Failed to load state, starting fresh: {e}")
-        return BotState()
+# ----------------------------
+# Paper portfolio
+# ----------------------------
+class PaperPortfolio:
+    def __init__(self, starting_equity: float):
+        self.starting_equity = float(starting_equity)
+        self.cash = float(starting_equity)
+        self.open_positions: Dict[str, Dict[str, Any]] = {}  # trade_id -> position
+        self.trade_pnls: List[float] = []
 
+    def equity(self, mark_prices: Dict[str, float]) -> float:
+        eq = self.cash
+        for pos in self.open_positions.values():
+            mkt = pos["market"]
+            mark = mark_prices.get(mkt)
+            if mark is None:
+                continue
+            # Long only in this template:
+            eq += (mark - pos["entry_price"]) * pos["size"]
+        return float(eq)
 
-def save_state(state: BotState) -> None:
-    ensure_data_dir()
-    tmp = BOT_STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state.to_json(), f, indent=2)
-    os.replace(tmp, BOT_STATE_FILE)
+    def open_long(self, market: str, entry_price: float, size: float, meta: Dict[str, Any]) -> Dict[str, Any]:
+        trade_id = meta.get("trade_id") or str(uuid.uuid4())
+        if trade_id in self.open_positions:
+            raise RuntimeError("trade_id already open")
 
+        cost = entry_price * size
+        if cost > self.cash:
+            raise RuntimeError("Insufficient cash for paper buy")
 
-# ---------------------------
-# Heartbeat
-# ---------------------------
-def write_heartbeat(state: BotState, status: str, note: str = "") -> Dict[str, Any]:
-    ensure_data_dir()
-    state.normalize_positions()
-
-    payload = {
-        "time_utc": now_utc_iso(),
-        "status": status,
-        "note": note,
-        "equity_usd": float(state.equity_usd),
-        "open_positions": [p.get("market") for p in state.open_positions if isinstance(p, dict)],
-    }
-
-    tmp = HEARTBEAT_JSON + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, HEARTBEAT_JSON)
-
-    with open(HEARTBEAT_TXT, "w", encoding="utf-8") as f:
-        f.write(f"{payload['time_utc']} | {status} | equity={payload['equity_usd']}\n")
-
-    # push to dashboard API
-    push_heartbeat(payload)
-
-    return payload
-
-
-# ---------------------------
-# CSV outputs + API push
-# ---------------------------
-def record_equity(equity_usd: float) -> None:
-    _ensure_csv_header(EQUITY_CSV, ["time_utc", "equity_usd"])
-    payload = {"time_utc": now_utc_iso(), "equity_usd": float(equity_usd)}
-    _append_csv_row(EQUITY_CSV, [payload["time_utc"], payload["equity_usd"]])
-
-    # push to dashboard API (so equity curve renders)
-    push_equity(payload)
-
-
-def record_trade(row: Dict[str, Any]) -> None:
-    _ensure_csv_header(
-        TRADES_CSV,
-        [
-            "entry_time",
-            "exit_time",
-            "hold_minutes",
-            "market",
-            "entry_price",
-            "exit_price",
-            "qty",
-            "pnl_usd",
-            "pnl_pct",
-            "take_profit_pct",
-            "stop_loss_pct",
-            "risk_mode",
-            "trend_strength",
-            "rsi",
-            "volatility",
-        ],
-    )
-
-    _append_csv_row(
-        TRADES_CSV,
-        [
-            row.get("entry_time", ""),
-            row.get("exit_time", ""),
-            row.get("hold_minutes", 0.0),
-            row.get("market", ""),
-            row.get("entry_price", 0.0),
-            row.get("exit_price", 0.0),
-            row.get("qty", 0.0),
-            row.get("pnl_usd", 0.0),
-            row.get("pnl_pct", 0.0),
-            row.get("take_profit_pct", TAKE_PROFIT_PCT),
-            row.get("stop_loss_pct", STOP_LOSS_PCT),
-            row.get("risk_mode", RISK_MODE),
-            row.get("trend_strength", ""),
-            row.get("rsi", ""),
-            row.get("volatility", ""),
-        ],
-    )
-
-    # push to dashboard API
-    push_trade(row)
-
-
-# ---------------------------
-# Prices
-# ---------------------------
-def fetch_coinbase_spot(market: str) -> Optional[float]:
-    if requests is None:
-        return None
-    try:
-        url = COINBASE_SPOT.format(symbol=market)
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        amt = data.get("data", {}).get("amount")
-        return _safe_float(amt, None)
-    except Exception:
-        return None
-
-
-def fetch_prices(markets: List[str]) -> Dict[str, float]:
-    prices: Dict[str, float] = {}
-    for m in markets:
-        p = fetch_coinbase_spot(m)
-        if p is not None and p > 0:
-            prices[m] = p
-    return prices
-
-
-# ---------------------------
-# Simple paper strategy
-# ---------------------------
-def should_enter_long(market: str) -> bool:
-    return random.random() < ENTRY_CHANCE
-
-
-def close_reason(pos: Dict[str, Any], price: float) -> Optional[str]:
-    entry = _safe_float(pos.get("entry_price"), None) or 0.0
-    if entry <= 0:
-        return None
-
-    tp = float(pos.get("take_profit_pct", TAKE_PROFIT_PCT)) / 100.0
-    sl = float(pos.get("stop_loss_pct", STOP_LOSS_PCT)) / 100.0
-
-    if price >= entry * (1.0 + tp):
-        return "TP"
-    if price <= entry * (1.0 - sl):
-        return "SL"
-
-    hold = _minutes_between(pos.get("entry_time", now_utc_iso()), now_utc_iso())
-    if hold >= MAX_HOLD_MINUTES:
-        return "TIME"
-
-    return None
-
-
-def open_position(state: BotState, market: str, price: float) -> None:
-    qty = 0.0 if price <= 0 else POSITION_USD / price
-
-    pos = Position(
-        market=market,
-        entry_time=now_utc_iso(),
-        entry_price=float(price),
-        qty=float(qty),
-        take_profit_pct=TAKE_PROFIT_PCT,
-        stop_loss_pct=STOP_LOSS_PCT,
-        risk_mode=RISK_MODE,
-    ).to_dict()
-
-    state.open_positions.append(pos)
-
-    log.info(
-        f"[ENTRY] Opened LONG {market} @ {price:.6f} qty={qty:.6f} "
-        f"TP={TAKE_PROFIT_PCT:.1f}% SL={STOP_LOSS_PCT:.1f}%"
-    )
-
-
-def close_position(state: BotState, pos: Dict[str, Any], exit_price: float, reason: str) -> None:
-    entry_price = float(pos.get("entry_price", 0.0) or 0.0)
-    qty = float(pos.get("qty", 0.0) or 0.0)
-
-    if entry_price <= 0 or qty <= 0:
-        pnl = 0.0
-        pnl_pct = 0.0
-    else:
-        pnl = (exit_price - entry_price) * qty
-        pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
-
-    exit_time = now_utc_iso()
-    hold_minutes = _minutes_between(pos.get("entry_time", exit_time), exit_time)
-
-    state.equity_usd = float(state.equity_usd) + float(pnl)
-
-    record_trade(
-        {
-            "entry_time": pos.get("entry_time", ""),
-            "exit_time": exit_time,
-            "hold_minutes": hold_minutes,
-            "market": pos.get("market", ""),
-            "entry_price": entry_price,
-            "exit_price": float(exit_price),
-            "qty": qty,
-            "pnl_usd": float(pnl),
-            "pnl_pct": float(pnl_pct),
-            "take_profit_pct": pos.get("take_profit_pct", TAKE_PROFIT_PCT),
-            "stop_loss_pct": pos.get("stop_loss_pct", STOP_LOSS_PCT),
-            "risk_mode": pos.get("risk_mode", RISK_MODE),
-            "trend_strength": pos.get("trend_strength", ""),
-            "rsi": pos.get("rsi", ""),
-            "volatility": pos.get("volatility", ""),
+        self.cash -= cost
+        self.open_positions[trade_id] = {
+            "trade_id": trade_id,
+            "market": market,
+            "side": "BUY",
+            "entry_price": float(entry_price),
+            "size": float(size),
+            "opened_utc": utc_now_iso(),
+            **meta
         }
-    )
+        return self.open_positions[trade_id]
 
-    log.info(f"[EXIT] Closed {pos.get('market')} reason={reason} pnl=${pnl:.2f} equity=${state.equity_usd:.2f}")
+    def close_long(self, trade_id: str, exit_price: float, fees_usd: float = 0.0) -> Dict[str, Any]:
+        if trade_id not in self.open_positions:
+            raise RuntimeError("trade_id not open")
+
+        pos = self.open_positions.pop(trade_id)
+        entry_price = pos["entry_price"]
+        size = pos["size"]
+
+        proceeds = exit_price * size
+        pnl = (exit_price - entry_price) * size - float(fees_usd)
+
+        self.cash += proceeds
+        self.trade_pnls.append(float(pnl))
+
+        closed = {
+            "trade_id": trade_id,
+            "market": pos["market"],
+            "side": "SELL",
+            "entry_price": float(entry_price),
+            "exit_price": float(exit_price),
+            "size": float(size),
+            "pnl_usd": float(pnl),
+            "fees_usd": float(fees_usd),
+            "closed_utc": utc_now_iso(),
+        }
+        return closed
 
 
-# ---------------------------
+# ----------------------------
+# Strategy (simple + stable)
+# ----------------------------
+def decide_signal(closes: List[float]) -> Dict[str, Any]:
+    """
+    Returns:
+      action: BUY/SELL/HOLD
+      confidence: 0..1
+      reasons: list[str]
+    """
+    if len(closes) < 60:
+        return {"action": "HOLD", "confidence": 0.0, "reasons": ["not_enough_data"]}
+
+    current = closes[-1]
+    r = rsi(closes, 14)
+    ema_fast = ema(closes[-60:], 20)
+    ema_slow = ema(closes[-60:], 50)
+
+    reasons = []
+    confidence = 0.50
+
+    trend_up = (ema_fast is not None and ema_slow is not None and ema_fast > ema_slow)
+    oversold = (r is not None and r < 30)
+
+    if trend_up:
+        reasons.append("trend_up (EMA20>EMA50)")
+        confidence += 0.08
+    if oversold:
+        reasons.append("RSI_oversold (<30)")
+        confidence += 0.12
+
+    # Buy logic
+    if trend_up and (oversold or (r is not None and r < 40)):
+        return {"action": "BUY", "confidence": min(confidence, 0.95), "reasons": reasons or ["trend_up"]}
+
+    # Sell logic (simple exit condition)
+    if r is not None and r > 65:
+        reasons.append("RSI_overbought (>65)")
+        return {"action": "SELL", "confidence": 0.60, "reasons": reasons}
+
+    return {"action": "HOLD", "confidence": 0.45, "reasons": reasons or ["no_edge"]}
+
+
+# ----------------------------
 # Main loop
-# ---------------------------
-def main() -> None:
-    ensure_data_dir()
-    state = load_state()
-    state.normalize_positions()
+# ----------------------------
+def main():
+    # ---- Config via env ----
+    markets = os.getenv("MARKETS", "BTC-USD,ETH-USD").split(",")
+    markets = [m.strip() for m in markets if m.strip()]
 
-    _ensure_csv_header(EQUITY_CSV, ["time_utc", "equity_usd"])
-    _ensure_csv_header(
-        TRADES_CSV,
-        [
-            "entry_time",
-            "exit_time",
-            "hold_minutes",
-            "market",
-            "entry_price",
-            "exit_price",
-            "qty",
-            "pnl_usd",
-            "pnl_pct",
-            "take_profit_pct",
-            "stop_loss_pct",
-            "risk_mode",
-            "trend_strength",
-            "rsi",
-            "volatility",
-        ],
-    )
-    _ensure_csv_header(TRAINING_FILE, ["time_utc", "event", "details"])
+    cycle_seconds = int(os.getenv("CYCLE_SECONDS", "360"))  # 6 min default
+    granularity_sec = int(os.getenv("GRANULARITY_SEC", "300"))  # 5m candles
+    candle_limit = int(os.getenv("CANDLE_LIMIT", "120"))
 
-    log.info("Crypto-AI-Bot running (paper trading, Coinbase prices)")
-    log.info(f"DATA_DIR={DATA_DIR}")
-    log.info(f"Markets={MARKETS}")
-    log.info(f"Cycle seconds={CYCLE_SECONDS}")
-    log.info(f"API_URL={API_URL if API_URL else '(none)'} API_KEY={'(set)' if API_KEY else '(disabled)'}")
-    log.info(f"Equity=${state.equity_usd:.2f}")
+    starting_equity = float(os.getenv("STARTING_EQUITY_USD", "1000"))
+    trade_size_units = float(os.getenv("TRADE_SIZE_UNITS", "0.01"))  # size in base units (BTC etc)
+    max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
-    # Boot
-    write_heartbeat(state, "running", note="boot")
-    record_equity(state.equity_usd)
-    save_state(state)
+    # Risk/exit rules
+    take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.008"))   # 0.8%
+    stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.006"))       # 0.6%
+
+    # ---- Init ----
+    logger = BotLogger(log_dir="logs")
+    client = ApiClient()
+    portfolio = PaperPortfolio(starting_equity=starting_equity)
+
+    logger.event("config", {
+        "markets": markets,
+        "cycle_seconds": cycle_seconds,
+        "granularity_sec": granularity_sec,
+        "candle_limit": candle_limit,
+        "starting_equity_usd": starting_equity,
+        "trade_size_units": trade_size_units,
+        "max_open_positions": max_open_positions,
+        "take_profit_pct": take_profit_pct,
+        "stop_loss_pct": stop_loss_pct
+    })
+
+    cycle = 0
 
     while True:
+        cycle += 1
         try:
-            state.normalize_positions()
+            logger.heartbeat("running", {"cycle": cycle})
 
-            prices = fetch_prices(MARKETS)
+            mark_prices: Dict[str, float] = {}
 
-            # Close logic
-            still_open: List[Dict[str, Any]] = []
-            for p in state.open_positions:
-                if not isinstance(p, dict):
-                    continue  # should never happen after normalize_positions()
+            # 1) Fetch data and generate signals
+            for market in markets:
+                closes = fetch_candles_closes(client, market, granularity_sec, candle_limit)
+                price = float(closes[-1])
+                mark_prices[market] = price
 
-                m = p.get("market")
-                if not m or m not in prices:
-                    still_open.append(p)
-                    continue
+                sig = decide_signal(closes)
+                action = sig["action"]
+                confidence = float(sig["confidence"])
+                reasons = sig["reasons"]
 
-                reason = close_reason(p, prices[m])
-                if reason:
-                    close_position(state, p, prices[m], reason)
-                else:
-                    still_open.append(p)
+                # Event log the signal (THIS is your proper events log)
+                logger.event("signal", {
+                    "market": market,
+                    "action": action,
+                    "confidence": confidence,
+                    "reason": reasons,
+                    "price": price,
+                    "size": trade_size_units,
+                })
 
-            state.open_positions = still_open
+                # 2) Manage existing positions: stop-loss / take-profit
+                # (We iterate positions safely by copying items)
+                for trade_id, pos in list(portfolio.open_positions.items()):
+                    if pos["market"] != market:
+                        continue
+                    entry = pos["entry_price"]
+                    size = pos["size"]
 
-            # Entry logic
-            open_markets = set(pp.get("market") for pp in state.open_positions if isinstance(pp, dict))
-            if len(state.open_positions) < MAX_OPEN_POSITIONS:
-                candidates = [m for m in MARKETS if m in prices and m not in open_markets]
-                random.shuffle(candidates)
-                for m in candidates:
-                    if len(state.open_positions) >= MAX_OPEN_POSITIONS:
-                        break
-                    if should_enter_long(m):
-                        open_position(state, m, prices[m])
+                    # Long PnL% (approx)
+                    pnl_pct = (price - entry) / entry
 
-            # Persist
-            record_equity(state.equity_usd)
-            save_state(state)
-            write_heartbeat(state, "running", note="cycle")
+                    if pnl_pct >= take_profit_pct:
+                        closed = portfolio.close_long(trade_id, exit_price=price, fees_usd=0.0)
+                        logger.trade_close(closed)
 
-            log.info(
-                f"[CYCLE] {now_utc_iso()} open={[p.get('market') for p in state.open_positions if isinstance(p, dict)]} "
-                f"equity=${state.equity_usd:.2f}"
-            )
+                    elif pnl_pct <= -stop_loss_pct:
+                        closed = portfolio.close_long(trade_id, exit_price=price, fees_usd=0.0)
+                        logger.trade_close(closed)
+
+                # 3) Entry / Exit decisions
+                # SELL signal: close one position for this market (if any)
+                if action == "SELL":
+                    # close first open pos on this market
+                    for trade_id, pos in list(portfolio.open_positions.items()):
+                        if pos["market"] == market:
+                            closed = portfolio.close_long(trade_id, exit_price=price, fees_usd=0.0)
+                            logger.trade_close(closed)
+                            break
+
+                # BUY signal: open if under max positions
+                if action == "BUY":
+                    if len(portfolio.open_positions) < max_open_positions:
+                        # Open a long
+                        opened = portfolio.open_long(
+                            market=market,
+                            entry_price=price,
+                            size=trade_size_units,
+                            meta={
+                                "strategy": "ema_rsi_template",
+                                "confidence": confidence,
+                                "reasons": reasons,
+                            }
+                        )
+                        logger.trade_open(opened)
+
+            # 4) Equity logging (THIS fixes your time_utc null problem)
+            eq = portfolio.equity(mark_prices)
+            logger.equity_point(eq, payload={
+                "cycle": cycle,
+                "open_positions": len(portfolio.open_positions)
+            })
+
+            # 5) sleep until next cycle
+            time.sleep(cycle_seconds)
 
         except Exception as e:
-            log.exception(f"Unhandled error in cycle: {e}")
-            try:
-                write_heartbeat(state, "error", note=str(e)[:200])
-                save_state(state)
-            except Exception:
-                pass
-
-        time.sleep(CYCLE_SECONDS)
+            logger.event("error", {"message": str(e)})
+            logger.heartbeat("error", {"cycle": cycle, "error": str(e)})
+            # Re-raise so you can see the crash in logs/console too
+            raise
 
 
 if __name__ == "__main__":
