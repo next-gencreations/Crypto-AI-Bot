@@ -432,7 +432,7 @@ def main():
         run_cycle(state, positions)
         save_state(state, positions)
 
-    except Exception as e:
+           except Exception as e:
         err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         heartbeat("error", {"message": str(e)})
         log_event("error", {"message": str(e), "traceback": err})
