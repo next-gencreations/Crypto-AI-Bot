@@ -1,790 +1,602 @@
-#!/usr/bin/env python3
-"""
-main.py — AI Trading Bot + Tamagotchi Life + Dashboard API + Event Logging
-
-What this gives you:
-- JSONL events log: runtime/events.jsonl
-- State persistence: runtime/state.json
-- Dashboard status: runtime/status.json
-- Brain signal output: runtime/brain_signal.json
-- Simple HTTP API for your dashboard:
-    GET http://localhost:<PORT>/status
-    GET http://localhost:<PORT>/events?n=200
-
-Runs in one process:
-- Background bot loop
-- Lightweight HTTP server for dashboard
-"""
-
-from __future__ import annotations
-
-import json
 import os
-import sys
+import json
 import time
 import math
-import signal
-import random
-import threading
+import logging
 import traceback
-from dataclasses import dataclass, asdict, field
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
-# -----------------------------
-# Config (via Environment Vars)
-# -----------------------------
-BOT_NAME = os.getenv("BOT_NAME", "TradePilot")
-RUNTIME_DIR = os.getenv("RUNTIME_DIR", "runtime")
+# ============================================================
+# Logging (Render-friendly: goes to stdout)
+# ============================================================
 
-# Market + loop
-MARKET = os.getenv("MARKET", "BTC-USD")
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "15"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "30"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("crypto-ai-bot")
 
-# Risk controls (these stop the bot from blowing up)
-START_EQUITY_USD = float(os.getenv("START_EQUITY_USD", "1000"))
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "150"))           # max exposure
-MAX_TRADE_USD = float(os.getenv("MAX_TRADE_USD", "50"))                  # per trade cap
-MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "25"))        # daily circuit breaker
-MAX_DRAWDOWN_USD = float(os.getenv("MAX_DRAWDOWN_USD", "75"))            # full stop
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))              # after a trade or error
+# ============================================================
+# Env helpers
+# ============================================================
 
-# Strategy thresholds
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
-RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
-CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.58"))
+def env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v.strip() if v and v.strip() else default
 
-# Dashboard API
-DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
-BIND_HOST = os.getenv("BIND_HOST", "0.0.0.0")
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
-# Exchange wiring (YOU MUST SET THESE if you want real trading)
-EXCHANGE_MODE = os.getenv("EXCHANGE_MODE", "PAPER").upper()  # PAPER or LIVE
-EXCHANGE_BASE_URL = os.getenv("EXCHANGE_BASE_URL", "")       # your new URL(s)
-EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
-EXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET", "")
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except Exception:
+        return default
 
-# --------------
-# File locations
-# --------------
-EVENTS_PATH = os.path.join(RUNTIME_DIR, "events.jsonl")
-STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
-STATUS_PATH = os.path.join(RUNTIME_DIR, "status.json")
-BRAIN_PATH = os.path.join(RUNTIME_DIR, "brain_signal.json")
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def utc_now() -> str:
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-def ensure_runtime_dir() -> None:
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-
-def safe_write_json(path: str, data: Any) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=False)
-    os.replace(tmp, path)
-
-def append_jsonl(path: str, item: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def pct(a: float, b: float) -> float:
-    if b == 0:
-        return 0.0
-    return (a / b) * 100.0
+# ============================================================
+# Config
+# ============================================================
 
-# -----------------------------
+PORT = env_int("PORT", 10000)
+
+# If you have an external price API, keep it here.
+# If not, the bot will still run and just "idle" safely.
+API_URL = env_str("API_URL", "").rstrip("/")
+CRYPTO_AI_API_URL = env_str("CRYPTO_AI_API_URL", API_URL).rstrip("/")
+
+MARKETS = [m.strip() for m in env_str("MARKETS", "BTC-USD,ETH-USD").split(",") if m.strip()]
+CYCLE_SECONDS = env_int("CYCLE_SECONDS", 360)      # 6 mins
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
+START_EQUITY = env_float("START_EQUITY", 1000.0)
+
+# Strategy params
+RSI_PERIOD = env_int("RSI_PERIOD", 14)
+SMA_FAST = env_int("SMA_FAST", 10)
+SMA_SLOW = env_int("SMA_SLOW", 30)
+
+# Risk management
+RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 0.5)  # 0.5% default
+STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.8)            # 0.8% SL
+TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 1.2)        # 1.2% TP
+MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 0.55)
+
+# Storage
+DATA_DIR = env_str("DATA_DIR", "data")
+LOG_DIR = env_str("LOG_DIR", "logs")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+TRADES_FILE = os.path.join(DATA_DIR, "trades.json")
+EQUITY_FILE = os.path.join(DATA_DIR, "equity.json")
+PET_FILE = os.path.join(DATA_DIR, "pet.json")
+
+# ============================================================
 # Data models
-# -----------------------------
+# ============================================================
+
+@dataclass
+class Position:
+    market: str
+    side: str              # "LONG" only (paper)
+    entry_price: float
+    size_usd: float
+    stop_price: float
+    take_price: float
+    opened_time_utc: str
+    confidence: float
+    reason: str
+    pnl_usd: Optional[float] = None
+
 @dataclass
 class Trade:
-    time_utc: str
     market: str
-    side: str  # BUY/SELL
-    price: float
-    size: float
-    notional_usd: float
-    pnl_usd: Optional[float] = None
-    confidence: float = 0.0
-    reason: List[str] = field(default_factory=list)
+    side: str              # "BUY"/"SELL"
+    pnl_usd: float
+    time: str
 
 @dataclass
-class BotState:
-    start_time_utc: str = field(default_factory=utc_now)
-    last_heartbeat_utc: str = field(default_factory=utc_now)
-    status: str = "starting"
-    equity_usd: float = START_EQUITY_USD
-    peak_equity_usd: float = START_EQUITY_USD
-    daily_start_equity_usd: float = START_EQUITY_USD
-    daily_date_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).date().isoformat())
-    open_position_usd: float = 0.0
-    open_position_size: float = 0.0
-    open_position_avg_price: float = 0.0
-    trades: List[Trade] = field(default_factory=list)
-    errors: int = 0
-    last_trade_utc: Optional[str] = None
-    cooldown_until_utc: Optional[str] = None
+class Pet:
+    stage: str = "egg"         # egg -> hatched
+    mood: str = "sleepy"       # happy/ok/sad/angry/sleepy
+    health: float = 100.0      # 0..100
+    hunger: float = 100.0      # 0..100 (higher is hungrier)
+    growth: float = 0.0        # 0..100
+    fainted: bool = False
+    last_update_utc: str = ""
 
-@dataclass
-class Tamagotchi:
-    born_utc: str = field(default_factory=utc_now)
-    age_hours: float = 0.0
-    health: float = 100.0          # 0..100
-    mood: float = 50.0             # 0..100
-    hunger: float = 0.0            # 0..100 (higher = worse)
-    energy: float = 100.0          # 0..100
-    streak_wins: int = 0
-    streak_losses: int = 0
-    alive: bool = True
-    last_update_utc: str = field(default_factory=utc_now)
+# ============================================================
+# Persistence helpers
+# ============================================================
 
-# -----------------------------
-# Logging / Eventing
-# -----------------------------
-class EventLog:
-    def __init__(self, path: str):
-        self.path = path
-        self.lock = threading.Lock()
+def read_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-    def event(self, kind: str, payload: Dict[str, Any]) -> None:
-        item = {
-            "time_utc": utc_now(),
-            "kind": kind,
-            "payload": payload,
-        }
-        with self.lock:
-            append_jsonl(self.path, item)
+def write_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-# -----------------------------
-# Indicators (simple + robust)
-# -----------------------------
-def rsi(prices: List[float], period: int = 14) -> Optional[float]:
-    if len(prices) < period + 1:
+# ============================================================
+# Simple indicators
+# ============================================================
+
+def sma(values: List[float], period: int) -> Optional[float]:
+    if period <= 0 or len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+def rsi(values: List[float], period: int) -> Optional[float]:
+    if period <= 0 or len(values) < period + 1:
         return None
     gains = 0.0
     losses = 0.0
     for i in range(-period, 0):
-        change = prices[i] - prices[i - 1]
-        if change >= 0:
-            gains += change
+        diff = values[i] - values[i - 1]
+        if diff >= 0:
+            gains += diff
         else:
-            losses += abs(change)
+            losses -= diff
     if losses == 0:
         return 100.0
     rs = gains / losses
     return 100.0 - (100.0 / (1.0 + rs))
 
-def sma(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / float(period)
+# ============================================================
+# External API fetch
+# ============================================================
 
-def trend_up(prices: List[float]) -> Optional[bool]:
-    # simple trend: short SMA above long SMA
-    s = sma(prices, 10)
-    l = sma(prices, 30)
-    if s is None or l is None:
-        return None
-    return s > l
-
-# -----------------------------
-# Exchange adapter (plug your URLs in here)
-# -----------------------------
-class Exchange:
-    """
-    PAPER mode: simulates fills at current price.
-    LIVE mode: you MUST implement the 3 marked methods for your exchange URLs.
-    """
-
-    def __init__(self, mode: str, base_url: str, api_key: str, api_secret: str, elog: EventLog):
-        self.mode = mode
-        self.base_url = base_url
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.elog = elog
-
-    def get_latest_price(self, market: str) -> float:
-        if self.mode == "PAPER":
-            # Replace with real price feed later; this is a harmless placeholder.
-            # Uses a slow random walk so the bot can run and generate logs.
-            # If you already have a market data endpoint, wire it below.
-            return self._paper_price_walk(market)
-
-        # ----- LIVE: IMPLEMENT THIS -----
-        # You said you have new URLs. Put your actual HTTP call here.
-        # Return latest traded price as float.
-        raise NotImplementedError("LIVE mode get_latest_price() not implemented yet")
-
-    def place_order(self, market: str, side: str, notional_usd: float, price_hint: float) -> Dict[str, Any]:
-        """
-        Return a dict with:
-        - filled_price
-        - filled_size
-        - order_id
-        """
-        if self.mode == "PAPER":
-            filled_price = price_hint
-            filled_size = notional_usd / max(filled_price, 1e-9)
-            return {
-                "order_id": f"paper-{int(time.time()*1000)}",
-                "filled_price": filled_price,
-                "filled_size": filled_size,
-            }
-
-        # ----- LIVE: IMPLEMENT THIS -----
-        # Place real order via your exchange API
-        raise NotImplementedError("LIVE mode place_order() not implemented yet")
-
-    def _paper_price_walk(self, market: str) -> float:
-        # stable seed per market
-        seed = abs(hash(market)) % 10_000
-        random.seed(seed + int(time.time() // 10))
-        base = 42000.0 if "BTC" in market.upper() else 100.0
-        jitter = random.uniform(-80, 80)
-        return max(1.0, base + jitter)
-
-# -----------------------------
-# Brain (signal generator)
-# -----------------------------
-def generate_signal(price: float, prices: List[float]) -> Dict[str, Any]:
-    r = rsi(prices, 14)
-    tu = trend_up(prices)
-    reasons = []
-    conf = 0.5
-    action = "HOLD"
-
-    if r is not None:
-        if r <= RSI_OVERSOLD:
-            reasons.append("RSI oversold")
-            conf += 0.10
-        elif r >= RSI_OVERBOUGHT:
-            reasons.append("RSI overbought")
-            conf += 0.10
-
-    if tu is True:
-        reasons.append("trend up")
-        conf += 0.07
-    elif tu is False:
-        reasons.append("trend down")
-        conf += 0.07
-
-    # Decision logic (simple + stable)
-    if r is not None and tu is not None:
-        if r <= RSI_OVERSOLD and tu is True and conf >= CONFIDENCE_MIN:
-            action = "BUY"
-        elif r >= RSI_OVERBOUGHT and tu is False and conf >= CONFIDENCE_MIN:
-            action = "SELL"
-        else:
-            action = "HOLD"
-
-    conf = clamp(conf, 0.0, 0.99)
-
-    return {
-        "time": utc_now(),
-        "market": MARKET,
-        "action": action,
-        "confidence": conf,
-        "reason": reasons if reasons else ["no strong edge"],
-        "price": float(price),
-    }
-
-# -----------------------------
-# Metrics
-# -----------------------------
-def compute_advanced_metrics(trades: List[Trade], equity: float, peak_equity: float) -> Dict[str, Any]:
-    wins = [t for t in trades if (t.pnl_usd is not None and t.pnl_usd > 0)]
-    losses = [t for t in trades if (t.pnl_usd is not None and t.pnl_usd < 0)]
-    avg_win = sum(t.pnl_usd for t in wins) / len(wins) if wins else 0.0
-    avg_loss = abs(sum(t.pnl_usd for t in losses) / len(losses)) if losses else 0.0
-    best_trade = max((t.pnl_usd for t in trades if t.pnl_usd is not None), default=0.0)
-    worst_trade = min((t.pnl_usd for t in trades if t.pnl_usd is not None), default=0.0)
-
-    gross_profit = sum(t.pnl_usd for t in wins) if wins else 0.0
-    gross_loss = abs(sum(t.pnl_usd for t in losses)) if losses else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
-
-    max_dd = max(0.0, peak_equity - equity)
-
-    return {
-        "avg_win_usd": avg_win,
-        "avg_loss_usd": avg_loss,
-        "best_trade_usd": best_trade,
-        "worst_trade_usd": worst_trade,
-        "profit_factor": profit_factor,
-        "max_drawdown_usd": max_dd,
-        "wins": len(wins),
-        "losses": len(losses),
-        "total_trades": len([t for t in trades if t.pnl_usd is not None]),
-    }
-
-# -----------------------------
-# Tamagotchi life logic
-# -----------------------------
-def update_tamagotchi(t: Tamagotchi, state: BotState, metrics: Dict[str, Any]) -> Tamagotchi:
-    now = datetime.now(timezone.utc)
-    born = datetime.fromisoformat(t.born_utc)
-    t.age_hours = max(0.0, (now - born).total_seconds() / 3600.0)
-
-    # Performance impacts
-    pf = metrics.get("profit_factor")
-    max_dd = float(metrics.get("max_drawdown_usd", 0.0))
-
-    # Hunger increases over time; wins feed it; losses make it hungrier
-    t.hunger = clamp(t.hunger + 0.8, 0.0, 100.0)
-
-    # Mood responds to recent streaks and PF
-    if pf is None:
-        pf_score = 0.0
-    else:
-        # pf 1.0 is neutral. >1.5 good. <0.7 bad.
-        pf_score = clamp((pf - 1.0) * 25.0, -30.0, 30.0)
-
-    dd_penalty = clamp(max_dd * 0.6, 0.0, 50.0)
-
-    # Base drift
-    t.mood = clamp(t.mood + pf_score - (dd_penalty * 0.1) - (t.hunger * 0.05), 0.0, 100.0)
-
-    # Health responds to drawdown and hunger
-    t.health = clamp(t.health - (dd_penalty * 0.2) - (t.hunger * 0.08) + (pf_score * 0.05), 0.0, 100.0)
-
-    # Energy fades; rest if bot is in cooldown
-    in_cooldown = False
-    if state.cooldown_until_utc:
-        try:
-            cu = datetime.fromisoformat(state.cooldown_until_utc)
-            in_cooldown = now < cu
-        except Exception:
-            in_cooldown = False
-
-    if in_cooldown:
-        t.energy = clamp(t.energy + 2.0, 0.0, 100.0)
-    else:
-        t.energy = clamp(t.energy - 0.7, 0.0, 100.0)
-
-    # Alive logic
-    if t.health <= 0.0:
-        t.alive = False
-
-    t.last_update_utc = utc_now()
-    return t
-
-# -----------------------------
-# State load/save
-# -----------------------------
-def load_state() -> Tuple[BotState, Tamagotchi, List[float]]:
-    ensure_runtime_dir()
-    if not os.path.exists(STATE_PATH):
-        state = BotState()
-        tama = Tamagotchi()
-        prices: List[float] = []
-        return state, tama, prices
-
-    with open(STATE_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    # Backwards-safe parsing
-    state_raw = raw.get("state", {})
-    tama_raw = raw.get("tamagotchi", {})
-    prices = raw.get("prices", [])
-
-    # trades
-    trades = []
-    for tr in state_raw.get("trades", []):
-        trades.append(Trade(**tr))
-
-    state = BotState(**{k: v for k, v in state_raw.items() if k != "trades"})
-    state.trades = trades
-    tama = Tamagotchi(**tama_raw)
-    return state, tama, prices
-
-def save_state(state: BotState, tama: Tamagotchi, prices: List[float]) -> None:
-    ensure_runtime_dir()
-    payload = {
-        "state": {
-            **{k: v for k, v in asdict(state).items() if k != "trades"},
-            "trades": [asdict(t) for t in state.trades[-2000:]],  # cap size
-        },
-        "tamagotchi": asdict(tama),
-        "prices": prices[-3000:],  # cap size
-    }
-    safe_write_json(STATE_PATH, payload)
-
-# -----------------------------
-# Dashboard API server
-# -----------------------------
-class DashboardHandler(BaseHTTPRequestHandler):
-    def _send_json(self, obj: Any, code: int = 200) -> None:
-        body = json.dumps(obj, indent=2).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/status":
-            try:
-                if os.path.exists(STATUS_PATH):
-                    with open(STATUS_PATH, "r", encoding="utf-8") as f:
-                        self._send_json(json.load(f))
-                else:
-                    self._send_json({"ok": False, "error": "status not ready"}, 404)
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, 500)
-            return
-
-        if parsed.path == "/events":
-            qs = parse_qs(parsed.query or "")
-            n = int(qs.get("n", ["200"])[0])
-            n = max(1, min(n, 2000))
-            items = []
-            try:
-                if os.path.exists(EVENTS_PATH):
-                    with open(EVENTS_PATH, "r", encoding="utf-8") as f:
-                        lines = f.readlines()[-n:]
-                    for line in lines:
-                        line = line.strip()
-                        if line:
-                            items.append(json.loads(line))
-                self._send_json({"ok": True, "items": items})
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, 500)
-            return
-
-        # simple root
-        if parsed.path == "/":
-            self._send_json({
-                "ok": True,
-                "bot": BOT_NAME,
-                "endpoints": ["/status", "/events?n=200"],
-            })
-            return
-
-        self._send_json({"ok": False, "error": "not found"}, 404)
-
-def start_dashboard_server():
-    server = HTTPServer((BIND_HOST, DASHBOARD_PORT), DashboardHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return server
-
-# -----------------------------
-# Risk / trade helpers
-# -----------------------------
-def reset_daily_if_needed(state: BotState, elog: EventLog) -> None:
-    today = datetime.now(timezone.utc).date().isoformat()
-    if state.daily_date_utc != today:
-        state.daily_date_utc = today
-        state.daily_start_equity_usd = state.equity_usd
-        elog.event("daily_reset", {
-            "daily_date_utc": today,
-            "daily_start_equity_usd": state.daily_start_equity_usd,
-        })
-
-def daily_pnl(state: BotState) -> float:
-    return state.equity_usd - state.daily_start_equity_usd
-
-def in_cooldown(state: BotState) -> bool:
-    if not state.cooldown_until_utc:
-        return False
+def http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
     try:
-        return datetime.now(timezone.utc) < datetime.fromisoformat(state.cooldown_until_utc)
-    except Exception:
-        return False
+        req = Request(url, headers={"User-Agent": "crypto-ai-bot/1.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+        log.warning(f"GET failed {url}: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"GET failed {url}: {e}")
+        return None
 
-def set_cooldown(state: BotState, seconds: int) -> None:
-    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    state.cooldown_until_utc = until.isoformat()
-
-# -----------------------------
-# Core bot loop
-# -----------------------------
-STOP_REQUESTED = False
-
-def handle_stop(signum, frame):
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-
-signal.signal(signal.SIGINT, handle_stop)
-signal.signal(signal.SIGTERM, handle_stop)
-
-def write_status(state: BotState, tama: Tamagotchi, metrics: Dict[str, Any], last_signal: Dict[str, Any]) -> None:
-    payload = {
-        "bot_status": {
-            "status": state.status,
-            "last_heartbeat": state.last_heartbeat_utc,
-            "mode": EXCHANGE_MODE,
-            "market": MARKET,
-        },
-        "account": {
-            "equity_usd": state.equity_usd,
-            "peak_equity_usd": state.peak_equity_usd,
-            "daily_pnl_usd": daily_pnl(state),
-            "open_position_usd": state.open_position_usd,
-        },
-        "advanced_metrics": metrics,
-        "tamagotchi": asdict(tama),
-        "brain": last_signal,
-    }
-    safe_write_json(STATUS_PATH, payload)
-
-def write_brain_signal(signal_obj: Dict[str, Any]) -> None:
-    safe_write_json(BRAIN_PATH, signal_obj)
-
-def mark_trade_pnl_simple(state: BotState, trade: Trade) -> None:
+# Expected: your API might already have /prices or /candles.
+# If not, we still keep bot safe and idle.
+def fetch_prices_from_api(markets: List[str]) -> Dict[str, float]:
     """
-    Simple PnL marking:
-    - If BUY opens/increases position
-    - If SELL reduces/closes position, realize pnl vs average price
-    This is intentionally straightforward and robust.
+    Attempts:
+      1) {API_URL}/prices  -> {"BTC-USD": 43000.1, "ETH-USD": 2300.2}
+      2) {API_URL}/price?market=BTC-USD -> {"market":"BTC-USD","price":...}
     """
-    if trade.side == "BUY":
-        # Update weighted avg entry
-        new_size = state.open_position_size + trade.size
-        if new_size <= 0:
-            return
-        new_avg = (
-            (state.open_position_avg_price * state.open_position_size) + (trade.price * trade.size)
-        ) / new_size
-        state.open_position_size = new_size
-        state.open_position_avg_price = new_avg
-        state.open_position_usd = state.open_position_size * trade.price
-        trade.pnl_usd = None  # unrealized until sell
-        return
+    prices: Dict[str, float] = {}
 
-    if trade.side == "SELL":
-        # Realize pnl on reduced size
-        sell_size = min(trade.size, state.open_position_size)
-        if sell_size <= 0:
-            trade.pnl_usd = 0.0
-            return
+    if not API_URL:
+        return prices
 
-        entry = state.open_position_avg_price
-        realized = (trade.price - entry) * sell_size
-        trade.pnl_usd = realized
+    # Try bulk
+    bulk = http_get_json(f"{API_URL}/prices")
+    if isinstance(bulk, dict):
+        for m in markets:
+            v = bulk.get(m)
+            if isinstance(v, (int, float)) and v > 0:
+                prices[m] = float(v)
 
-        state.open_position_size = max(0.0, state.open_position_size - sell_size)
-        if state.open_position_size == 0.0:
-            state.open_position_avg_price = 0.0
-            state.open_position_usd = 0.0
+    # Fallback per market
+    for m in markets:
+        if m in prices:
+            continue
+        one = http_get_json(f"{API_URL}/price?market={m}")
+        if isinstance(one, dict):
+            v = one.get("price")
+            if isinstance(v, (int, float)) and v > 0:
+                prices[m] = float(v)
+
+    return prices
+
+def fetch_history_from_api(market: str, limit: int = 120) -> List[float]:
+    """
+    Attempts:
+      {API_URL}/history?market=BTC-USD&limit=120 -> {"closes":[...]}
+      or {"data":[{"close":...}, ...]}
+    """
+    if not API_URL:
+        return []
+
+    data = http_get_json(f"{API_URL}/history?market={market}&limit={limit}")
+    if not isinstance(data, dict):
+        return []
+
+    closes: List[float] = []
+    if isinstance(data.get("closes"), list):
+        for x in data["closes"]:
+            if isinstance(x, (int, float)) and x > 0:
+                closes.append(float(x))
+        return closes
+
+    if isinstance(data.get("data"), list):
+        for row in data["data"]:
+            if isinstance(row, dict):
+                c = row.get("close")
+                if isinstance(c, (int, float)) and c > 0:
+                    closes.append(float(c))
+        return closes
+
+    return []
+
+# ============================================================
+# Bot engine
+# ============================================================
+
+class Engine:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = read_json(STATE_FILE, {})
+        self.positions: List[Position] = []
+        self.trades: List[Trade] = []
+        self.equity_series: List[dict] = []
+        self.pet: Pet = Pet()
+
+        # Load persisted
+        self._load()
+
+        # Ensure baseline
+        if "equity_usd" not in self.state:
+            self.state["equity_usd"] = float(START_EQUITY)
+        self.last_heartbeat_utc = ""
+
+        # Stats
+        self.total_trades = int(self.state.get("total_trades", 0))
+        self.wins = int(self.state.get("wins", 0))
+        self.losses = int(self.state.get("losses", 0))
+        self.total_pnl = float(self.state.get("total_pnl_usd", 0.0))
+
+    def _load(self):
+        # positions
+        raw_positions = read_json(STATE_FILE, {}).get("positions", [])
+        if isinstance(raw_positions, list):
+            for p in raw_positions:
+                if isinstance(p, dict):
+                    try:
+                        self.positions.append(Position(**p))
+                    except Exception:
+                        pass
+
+        # trades
+        raw_trades = read_json(TRADES_FILE, [])
+        if isinstance(raw_trades, list):
+            for t in raw_trades[-200:]:
+                if isinstance(t, dict):
+                    try:
+                        self.trades.append(Trade(**t))
+                    except Exception:
+                        pass
+
+        # equity series
+        raw_eq = read_json(EQUITY_FILE, [])
+        if isinstance(raw_eq, list):
+            self.equity_series = raw_eq[-500:]
+
+        # pet
+        raw_pet = read_json(PET_FILE, {})
+        if isinstance(raw_pet, dict) and raw_pet:
+            try:
+                self.pet = Pet(**raw_pet)
+            except Exception:
+                self.pet = Pet()
+
+    def _persist(self):
+        # Persist state + positions
+        s = dict(self.state)
+        s["equity_usd"] = float(s.get("equity_usd", START_EQUITY))
+        s["positions"] = [asdict(p) for p in self.positions]
+        s["total_trades"] = self.total_trades
+        s["wins"] = self.wins
+        s["losses"] = self.losses
+        s["total_pnl_usd"] = self.total_pnl
+        write_json(STATE_FILE, s)
+
+        write_json(TRADES_FILE, [asdict(t) for t in self.trades][-500:])
+        write_json(EQUITY_FILE, self.equity_series[-500:])
+        write_json(PET_FILE, asdict(self.pet))
+
+    def _log_equity_point(self):
+        eq = float(self.state.get("equity_usd", START_EQUITY))
+        self.equity_series.append({"equity_usd": eq, "time_utc": utc_now_iso()})
+        self.equity_series = self.equity_series[-500:]
+
+    def _pet_tick(self):
+        """
+        Pet is tied to performance:
+          - wins reduce hunger and increase growth
+          - losses increase hunger and reduce health
+          - if total_pnl goes positive -> pet can hatch and improve mood
+        Also pet influences risk: when faint/sad -> reduce risk to protect it.
+        """
+        now = utc_now_iso()
+        self.pet.last_update_utc = now
+
+        # natural decay: gets a bit hungrier over time
+        self.pet.hunger = clamp(self.pet.hunger + 1.5, 0.0, 100.0)
+
+        # health depends on hunger
+        if self.pet.hunger > 85:
+            self.pet.health = clamp(self.pet.health - 2.0, 0.0, 100.0)
+        elif self.pet.hunger < 40:
+            self.pet.health = clamp(self.pet.health + 0.6, 0.0, 100.0)
+
+        # Mood
+        if self.pet.health <= 10:
+            self.pet.mood = "sad"
+        elif self.pet.health <= 30:
+            self.pet.mood = "ok"
+        elif self.pet.health <= 70:
+            self.pet.mood = "happy"
         else:
-            state.open_position_usd = state.open_position_size * trade.price
+            self.pet.mood = "happy"
 
-        # Update equity (realized)
-        state.equity_usd += realized
+        # Fainted logic
+        if self.pet.health <= 0:
+            self.pet.fainted = True
 
-def bot_loop():
-    global STOP_REQUESTED
+        # Hatch when total pnl is positive
+        if (not self.pet.fainted) and self.pet.stage == "egg" and self.total_pnl > 0:
+            self.pet.stage = "hatched"
+            self.pet.growth = 10.0
+            self.pet.mood = "happy"
 
-    ensure_runtime_dir()
-    elog = EventLog(EVENTS_PATH)
-    state, tama, prices = load_state()
+    def _pet_on_trade(self, pnl: float):
+        if pnl > 0:
+            self.pet.hunger = clamp(self.pet.hunger - 8.0, 0.0, 100.0)
+            self.pet.health = clamp(self.pet.health + 2.0, 0.0, 100.0)
+            self.pet.growth = clamp(self.pet.growth + 2.5, 0.0, 100.0)
+        else:
+            self.pet.hunger = clamp(self.pet.hunger + 9.0, 0.0, 100.0)
+            self.pet.health = clamp(self.pet.health - 4.0, 0.0, 100.0)
 
-    # Start dashboard server
-    server = start_dashboard_server()
-    elog.event("startup", {
-        "bot": BOT_NAME,
-        "market": MARKET,
-        "mode": EXCHANGE_MODE,
-        "dashboard_port": DASHBOARD_PORT,
-        "runtime_dir": RUNTIME_DIR,
-    })
+        if self.pet.health <= 0:
+            self.pet.fainted = True
 
-    exchange = Exchange(
-        mode=EXCHANGE_MODE,
-        base_url=EXCHANGE_BASE_URL,
-        api_key=EXCHANGE_API_KEY,
-        api_secret=EXCHANGE_API_SECRET,
-        elog=elog,
-    )
+    def effective_risk_multiplier(self) -> float:
+        """
+        Pet makes the bot act "responsible":
+          - If pet is fainted or low health -> risk down
+          - If pet is healthy -> normal
+        """
+        if self.pet.fainted:
+            return 0.0
+        if self.pet.health < 20:
+            return 0.25
+        if self.pet.health < 40:
+            return 0.5
+        return 1.0
 
-    last_heartbeat_ts = 0.0
-    last_signal: Dict[str, Any] = {"time": utc_now(), "market": MARKET, "action": "HOLD", "confidence": 0.0, "reason": ["boot"], "price": 0.0}
+    def win_rate(self) -> float:
+        total = self.wins + self.losses
+        return (self.wins / total) * 100.0 if total > 0 else 0.0
 
-    while not STOP_REQUESTED:
-        try:
-            state.status = "running"
-            reset_daily_if_needed(state, elog)
+    # ---------------------------
+    # Strategy
+    # ---------------------------
 
-            # Heartbeat
-            now_ts = time.time()
-            if now_ts - last_heartbeat_ts >= HEARTBEAT_SECONDS:
-                state.last_heartbeat_utc = utc_now()
-                last_heartbeat_ts = now_ts
-                elog.event("heartbeat", {"equity_usd": state.equity_usd, "open_position_usd": state.open_position_usd})
+    def generate_signal(self, market: str, closes: List[float]) -> Tuple[str, float, str]:
+        """
+        Returns: (action, confidence, reason)
+          action: "BUY" or "HOLD"
+        """
+        if len(closes) < max(RSI_PERIOD + 1, SMA_SLOW + 1):
+            return ("HOLD", 0.0, "not_enough_data")
 
-            # Circuit breakers
-            dd = state.peak_equity_usd - state.equity_usd
-            if dd > MAX_DRAWDOWN_USD:
-                state.status = "stopped_drawdown"
-                elog.event("circuit_breaker", {"reason": "max_drawdown", "drawdown_usd": dd})
-                set_cooldown(state, 10_000_000)  # effectively stop
-            if daily_pnl(state) <= -MAX_DAILY_LOSS_USD:
-                state.status = "stopped_daily_loss"
-                elog.event("circuit_breaker", {"reason": "max_daily_loss", "daily_pnl_usd": daily_pnl(state)})
-                set_cooldown(state, 10_000_000)
+        r = rsi(closes, RSI_PERIOD)
+        f = sma(closes, SMA_FAST)
+        s = sma(closes, SMA_SLOW)
+        if r is None or f is None or s is None:
+            return ("HOLD", 0.0, "indicator_unavailable")
 
-            # Cooldown = rest / avoid overtrading
-            if in_cooldown(state):
-                metrics = compute_advanced_metrics(state.trades, state.equity_usd, state.peak_equity_usd)
-                tama = update_tamagotchi(tama, state, metrics)
-                write_status(state, tama, metrics, last_signal)
-                save_state(state, tama, prices)
-                time.sleep(min(LOOP_SECONDS, 2))
+        last = closes[-1]
+        trend_up = f > s
+
+        # Confidence scoring (simple but stable)
+        conf = 0.50
+        reason_bits = []
+
+        if trend_up:
+            conf += 0.10
+            reason_bits.append("trend_up")
+        else:
+            conf -= 0.08
+            reason_bits.append("trend_down")
+
+        if r < 35:
+            conf += 0.10
+            reason_bits.append("rsi_oversold")
+        elif r > 70:
+            conf -= 0.12
+            reason_bits.append("rsi_overbought")
+
+        # Keep within bounds
+        conf = clamp(conf, 0.0, 1.0)
+
+        if trend_up and r < 60 and conf >= MIN_CONFIDENCE:
+            return ("BUY", conf, "|".join(reason_bits) + f"|rsi={r:.1f}|px={last:.2f}")
+
+        return ("HOLD", conf, "|".join(reason_bits) + f"|rsi={r:.1f}|px={last:.2f}")
+
+    # ---------------------------
+    # Position management
+    # ---------------------------
+
+    def open_position(self, market: str, price: float, confidence: float, reason: str):
+        if self.pet.fainted:
+            return
+
+        if len(self.positions) >= MAX_OPEN_POSITIONS:
+            return
+
+        # Risk scales down when pet is weak
+        risk_mult = self.effective_risk_multiplier()
+        if risk_mult <= 0:
+            return
+
+        equity = float(self.state.get("equity_usd", START_EQUITY))
+        risk_pct = RISK_PER_TRADE_PCT * risk_mult
+        risk_usd = equity * (risk_pct / 100.0)
+
+        # Use SL distance to size position (very simple sizing)
+        sl = price * (1.0 - STOP_LOSS_PCT / 100.0)
+        tp = price * (1.0 + TAKE_PROFIT_PCT / 100.0)
+        sl_dist = max(price - sl, 0.0000001)
+
+        # "size_usd" is amount of equity allocated, capped
+        # (This is paper-trading logic, not real exchange sizing)
+        size_usd = clamp(risk_usd * (price / sl_dist), 5.0, equity * 0.25)
+
+        pos = Position(
+            market=market,
+            side="LONG",
+            entry_price=float(price),
+            size_usd=float(size_usd),
+            stop_price=float(sl),
+            take_price=float(tp),
+            opened_time_utc=utc_now_iso(),
+            confidence=float(confidence),
+            reason=reason,
+            pnl_usd=None,
+        )
+        self.positions.append(pos)
+        log.info(f"OPEN {market} LONG size_usd={size_usd:.2f} entry={price:.2f} sl={sl:.2f} tp={tp:.2f} conf={confidence:.2f}")
+
+    def close_position(self, idx: int, price: float, why: str):
+        pos = self.positions[idx]
+        # PnL in USD approx: (price - entry) / entry * size_usd
+        pnl = ((price - pos.entry_price) / pos.entry_price) * pos.size_usd
+
+        self.total_pnl += pnl
+        self.total_trades += 1
+        if pnl >= 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+
+        # Update equity
+        self.state["equity_usd"] = float(self.state.get("equity_usd", START_EQUITY)) + pnl
+
+        # Record trade
+        self.trades.append(Trade(market=pos.market, side="SELL", pnl_usd=float(pnl), time=utc_now_iso()))
+        self.trades = self.trades[-200:]
+
+        # Pet reacts
+        self._pet_on_trade(pnl)
+
+        log.info(f"CLOSE {pos.market} pnl={pnl:.2f} ({why}) equity={self.state['equity_usd']:.2f}")
+
+        # Remove
+        self.positions.pop(idx)
+
+    # ---------------------------
+    # Main cycle
+    # ---------------------------
+
+    def run_cycle(self):
+        with self.lock:
+            self._pet_tick()
+
+        # Fetch prices (best effort)
+        prices = fetch_prices_from_api(MARKETS)
+
+        with self.lock:
+            # Mark-to-market and check exits
+            for i in range(len(self.positions) - 1, -1, -1):
+                pos = self.positions[i]
+                px = prices.get(pos.market)
+                if px is None:
+                    continue
+                if px <= pos.stop_price:
+                    self.close_position(i, px, "stop_loss")
+                elif px >= pos.take_price:
+                    self.close_position(i, px, "take_profit")
+
+        # If no API prices available, just persist + idle safely
+        if not prices:
+            with self.lock:
+                self._log_equity_point()
+                self.last_heartbeat_utc = utc_now_iso()
+                self._persist()
+            log.info("No prices available from API. Bot idling safely.")
+            return
+
+        # For each market, generate signal (history best-effort)
+        for m in MARKETS:
+            if m not in prices:
                 continue
+            closes = fetch_history_from_api(m, limit=180)
+            if not closes:
+                # fallback: create tiny history from current price (prevents crashes)
+                closes = [prices[m]] * (SMA_SLOW + RSI_PERIOD + 2)
 
-            # Get price
-            price = exchange.get_latest_price(MARKET)
-            prices.append(price)
+            action, confidence, reason = self.generate_signal(m, closes)
 
-            # Update peak equity (approx with current price if position open)
-            approx_equity = state.equity_usd
-            if state.open_position_size > 0:
-                # approximate unrealized
-                unreal = (price - state.open_position_avg_price) * state.open_position_size
-                approx_equity = state.equity_usd + unreal
-            state.peak_equity_usd = max(state.peak_equity_usd, approx_equity)
+            with self.lock:
+                already_open = any(p.market == m for p in self.positions)
+                if action == "BUY" and (not already_open) and confidence >= MIN_CONFIDENCE:
+                    self.open_position(m, prices[m], confidence, reason)
 
-            # Brain signal
-            last_signal = generate_signal(price, prices)
-            write_brain_signal(last_signal)
+        with self.lock:
+            self._log_equity_point()
+            self.last_heartbeat_utc = utc_now_iso()
+            self._persist()
 
-            # Event log signal (for dashboard brain history)
-            elog.event("signal", last_signal)
+    def snapshot_for_api(self) -> dict:
+        with self.lock:
+            equity = float(self.state.get("equity_usd", START_EQUITY))
+            total = self.wins + self.losses
+            win_rate = (self.wins / total) * 100.0 if total > 0 else 0.0
+            avg_pnl = (self.total_pnl / total) if total > 0 else 0.0
 
-            # Decide trade
-            action = last_signal["action"]
-            conf = float(last_signal["confidence"])
-            reasons = list(last_signal.get("reason", []))
+            # Per-market stats (simple)
+            market_stats = []
+            for m in MARKETS:
+                mt = [t for t in self.trades if t.market == m]
+                if mt:
+                    mw = len([t for t in mt if t.pnl_usd >= 0])
+                    ml = len(mt) - mw
+                    mp = sum(t.pnl_usd for t in mt)
+                    market_stats.append({
+                        "market": m,
+                        "trades": len(mt),
+                        "win_rate": (mw / len(mt)) * 100.0,
+                        "avg_pnl": mp / len(mt),
+                        "total_pnl": mp
+                    })
 
-            # Position sizing (simple, safe)
-            # - never exceed MAX_POSITION_USD exposure
-            # - never exceed MAX_TRADE_USD per trade
-            remaining_exposure = max(0.0, MAX_POSITION_USD - state.open_position_usd)
-            trade_notional = min(MAX_TRADE_USD, remaining_exposure)
+            # Recent trades
+            recent = [asdict(t) for t in self.trades[-25:]][::-1]
 
-            # Trade rules
-            did_trade = False
-            if action == "BUY" and conf >= CONFIDENCE_MIN and trade_notional >= 5.0:
-                order = exchange.place_order(MARKET, "BUY", trade_notional, price)
-                filled_price = float(order["filled_price"])
-                filled_size = float(order["filled_size"])
-
-                tr = Trade(
-                    time_utc=utc_now(),
-                    market=MARKET,
-                    side="BUY",
-                    price=filled_price,
-                    size=filled_size,
-                    notional_usd=trade_notional,
-                    pnl_usd=None,
-                    confidence=conf,
-                    reason=reasons,
-                )
-                state.trades.append(tr)
-                mark_trade_pnl_simple(state, tr)
-                state.last_trade_utc = tr.time_utc
-                did_trade = True
-                elog.event("trade", asdict(tr))
-
-            elif action == "SELL" and conf >= CONFIDENCE_MIN and state.open_position_size > 0:
-                # Sell up to MAX_TRADE_USD notional (or full close if smaller)
-                sell_notional = min(MAX_TRADE_USD, state.open_position_size * price)
-                order = exchange.place_order(MARKET, "SELL", sell_notional, price)
-                filled_price = float(order["filled_price"])
-                filled_size = float(order["filled_size"])
-
-                tr = Trade(
-                    time_utc=utc_now(),
-                    market=MARKET,
-                    side="SELL",
-                    price=filled_price,
-                    size=filled_size,
-                    notional_usd=sell_notional,
-                    pnl_usd=0.0,
-                    confidence=conf,
-                    reason=reasons,
-                )
-                state.trades.append(tr)
-                mark_trade_pnl_simple(state, tr)
-                state.last_trade_utc = tr.time_utc
-                did_trade = True
-                elog.event("trade", asdict(tr))
-
-            # Update tamagotchi + status
-            metrics = compute_advanced_metrics(state.trades, state.equity_usd, state.peak_equity_usd)
-            tama = update_tamagotchi(tama, state, metrics)
-
-            # If tamagotchi dies, stop trading
-            if not tama.alive:
-                state.status = "stopped_tamagotchi_dead"
-                elog.event("tamagotchi_dead", {"health": tama.health, "mood": tama.mood})
-                set_cooldown(state, 10_000_000)
-
-            write_status(state, tama, metrics, last_signal)
-            save_state(state, tama, prices)
-
-            # Cooldown after a trade
-            if did_trade:
-                set_cooldown(state, COOLDOWN_SECONDS)
-
-            time.sleep(LOOP_SECONDS)
-
-        except Exception as e:
-            state.errors += 1
-            state.status = "error"
-            err = {
-                "error": str(e),
-                "trace": traceback.format_exc(),
-            }
-            try:
-                elog.event("error", err)
-            except Exception:
-                pass
-
-            # write status even on error
-            metrics = compute_advanced_metrics(state.trades, state.equity_usd, state.peak_equity_usd)
-            try:
-                tama = update_tamagotchi(tama, state, metrics)
-                write_status(state, tama, metrics, last_signal)
-                save_state(state, tama, prices)
-            except Exception:
-                pass
-
-            # prevent crash-loop
-            set_cooldown(state, max(10, COOLDOWN_SECONDS))
-            time.sleep(2)
-
-    # Shutdown
-    state.status = "stopped"
-    state.last_heartbeat_utc = utc_now()
-    metrics = compute_advanced_metrics(state.trades, state.equity_usd, state.peak_equity_usd)
-    try:
-        tama = update_tamagotchi(tama, state, metrics)
-        write_status(state, tama, metrics, last_signal)
-        save_state(state, tama, prices)
-    except Exception:
-        pass
-
-    try:
-        elog.event("shutdown", {"status": state.status})
-    except Exception:
-        pass
-
-def main():
-    print(f"[{BOT_NAME}] starting… mode={EXCHANGE_MODE} market={MARKET} dashboard=:{DASHBOARD_PORT}")
-    bot_loop()
-    print(f"[{BOT_NAME}] stopped.")
-
-if __name__ == "__main__":
-    main()
+            return {
+                "equity_series": self.equity_series[-300:],
+                "total_trades": self.total_trades,
+                "wins": self.wins,
+                "losses": self.losses,
+                "win_rate": round(win_rate, 2),
+                "avg_pnl": round(avg_pnl, 4),
+                "
