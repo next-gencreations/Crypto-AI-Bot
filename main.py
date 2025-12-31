@@ -7,7 +7,16 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from urllib.request import Request, urlopen
+import logging
+import sys
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+log = logging.getLogger("crypto-ai-bot")
 # ============================================================
 # CONFIG
 # ============================================================
@@ -411,22 +420,24 @@ def main():
     log_equity(float(state["equity_usd"]), {"note": "startup"})
 
     while True:
-        try:
-            heartbeat("running", {
-                "markets": MARKETS,
-                "open_positions": len(positions),
-                "equity_usd": float(state.get("equity_usd", START_EQUITY))
-            })
+    try:
+        log.info("Bot cycle running")
 
-            run_cycle(state, positions)
-            save_state(state, positions)
+        heartbeat("running", {
+            "markets": MARKETS,
+            "open_positions": len(positions),
+            "equity_usd": float(state.get("equity_usd", START_EQUITY))
+        })
 
-        except Exception as e:
-            err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            heartbeat("error", {"message": str(e)})
-            log_event("error", {"message": str(e), "traceback": err})
+        run_cycle(state, positions)
+        save_state(state, positions)
 
-        time.sleep(CYCLE_SECONDS)
+    except Exception as e:
+        err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        heartbeat("error", {"message": str(e)})
+        log_event("error", {"message": str(e), "traceback": err})
+
+    time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
     main()
