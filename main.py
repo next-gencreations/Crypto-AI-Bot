@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import logging
 import traceback
 import threading
@@ -13,17 +12,14 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 # ============================================================
-# Logging (Render-friendly: goes to stdout)
+# Logging (Render-friendly: stdout)
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("crypto-ai-bot")
 
 # ============================================================
-# Env helpers
+# Helpers
 # ============================================================
 
 def env_str(name: str, default: str) -> str:
@@ -51,35 +47,15 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 # ============================================================
-# Config
+# Paths / Files
 # ============================================================
 
-PORT = env_int("PORT", 10000)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DASHBOARD_PATH = os.path.join(BASE_DIR, "dashboard.html")
 
-# If you have an external price API, keep it here.
-# If not, the bot will still run and just "idle" safely.
-API_URL = env_str("API_URL", "").rstrip("/")
-CRYPTO_AI_API_URL = env_str("CRYPTO_AI_API_URL", API_URL).rstrip("/")
-
-MARKETS = [m.strip() for m in env_str("MARKETS", "BTC-USD,ETH-USD").split(",") if m.strip()]
-CYCLE_SECONDS = env_int("CYCLE_SECONDS", 360)      # 6 mins
-MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
-START_EQUITY = env_float("START_EQUITY", 1000.0)
-
-# Strategy params
-RSI_PERIOD = env_int("RSI_PERIOD", 14)
-SMA_FAST = env_int("SMA_FAST", 10)
-SMA_SLOW = env_int("SMA_SLOW", 30)
-
-# Risk management
-RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 0.5)  # 0.5% default
-STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.8)            # 0.8% SL
-TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 1.2)        # 1.2% TP
-MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 0.55)
-
-# Storage
-DATA_DIR = env_str("DATA_DIR", "data")
-LOG_DIR = env_str("LOG_DIR", "logs")
+# storage dirs (Render disk or ephemeral)
+DATA_DIR = env_str("DATA_DIR", os.path.join(BASE_DIR, "data"))
+LOG_DIR = env_str("LOG_DIR", os.path.join(BASE_DIR, "logs"))
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -89,13 +65,38 @@ EQUITY_FILE = os.path.join(DATA_DIR, "equity.json")
 PET_FILE = os.path.join(DATA_DIR, "pet.json")
 
 # ============================================================
-# Data models
+# Config
+# ============================================================
+
+PORT = env_int("PORT", 10000)
+
+# Your price API base URL (no trailing /data etc)
+API_URL = env_str("API_URL", "").rstrip("/")
+
+MARKETS = [m.strip() for m in env_str("MARKETS", "BTC-USD,ETH-USD").split(",") if m.strip()]
+CYCLE_SECONDS = env_int("CYCLE_SECONDS", 360)
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 2)
+START_EQUITY = env_float("START_EQUITY", 1000.0)
+
+# indicators
+RSI_PERIOD = env_int("RSI_PERIOD", 14)
+SMA_FAST = env_int("SMA_FAST", 10)
+SMA_SLOW = env_int("SMA_SLOW", 30)
+
+# risk
+RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 0.5)  # % of equity at risk per trade
+STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.8)
+TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 1.2)
+MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 0.55)
+
+# ============================================================
+# Models
 # ============================================================
 
 @dataclass
 class Position:
     market: str
-    side: str              # "LONG" only (paper)
+    side: str
     entry_price: float
     size_usd: float
     stop_price: float
@@ -108,22 +109,22 @@ class Position:
 @dataclass
 class Trade:
     market: str
-    side: str              # "BUY"/"SELL"
+    side: str
     pnl_usd: float
     time: str
 
 @dataclass
 class Pet:
-    stage: str = "egg"         # egg -> hatched
-    mood: str = "sleepy"       # happy/ok/sad/angry/sleepy
-    health: float = 100.0      # 0..100
-    hunger: float = 100.0      # 0..100 (higher is hungrier)
-    growth: float = 0.0        # 0..100
+    stage: str = "egg"        # egg -> hatched
+    mood: str = "sleepy"
+    health: float = 100.0     # 0..100
+    hunger: float = 100.0     # 0..100 (higher = more hungry)
+    growth: float = 0.0       # 0..100
     fainted: bool = False
     last_update_utc: str = ""
 
 # ============================================================
-# Persistence helpers
+# Persistence
 # ============================================================
 
 def read_json(path: str, default):
@@ -140,7 +141,7 @@ def write_json(path: str, data) -> None:
     os.replace(tmp, path)
 
 # ============================================================
-# Simple indicators
+# Indicators
 # ============================================================
 
 def sma(values: List[float], period: int) -> Optional[float]:
@@ -165,7 +166,7 @@ def rsi(values: List[float], period: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 # ============================================================
-# External API fetch
+# HTTP helpers (API fetch)
 # ============================================================
 
 def http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
@@ -181,20 +182,16 @@ def http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
         log.warning(f"GET failed {url}: {e}")
         return None
 
-# Expected: your API might already have /prices or /candles.
-# If not, we still keep bot safe and idle.
 def fetch_prices_from_api(markets: List[str]) -> Dict[str, float]:
     """
-    Attempts:
-      1) {API_URL}/prices  -> {"BTC-USD": 43000.1, "ETH-USD": 2300.2}
-      2) {API_URL}/price?market=BTC-USD -> {"market":"BTC-USD","price":...}
+    Tries:
+      GET {API_URL}/prices -> {"BTC-USD": 123, ...}
+      GET {API_URL}/price?market=BTC-USD -> {"price": 123}
     """
     prices: Dict[str, float] = {}
-
     if not API_URL:
         return prices
 
-    # Try bulk
     bulk = http_get_json(f"{API_URL}/prices")
     if isinstance(bulk, dict):
         for m in markets:
@@ -202,7 +199,6 @@ def fetch_prices_from_api(markets: List[str]) -> Dict[str, float]:
             if isinstance(v, (int, float)) and v > 0:
                 prices[m] = float(v)
 
-    # Fallback per market
     for m in markets:
         if m in prices:
             continue
@@ -214,15 +210,14 @@ def fetch_prices_from_api(markets: List[str]) -> Dict[str, float]:
 
     return prices
 
-def fetch_history_from_api(market: str, limit: int = 120) -> List[float]:
+def fetch_history_from_api(market: str, limit: int = 180) -> List[float]:
     """
-    Attempts:
-      {API_URL}/history?market=BTC-USD&limit=120 -> {"closes":[...]}
-      or {"data":[{"close":...}, ...]}
+    Tries:
+      GET {API_URL}/history?market=BTC-USD&limit=180 -> {"closes":[...]}
+      OR -> {"data":[{"close":...}, ...]}
     """
     if not API_URL:
         return []
-
     data = http_get_json(f"{API_URL}/history?market={market}&limit={limit}")
     if not isinstance(data, dict):
         return []
@@ -245,35 +240,40 @@ def fetch_history_from_api(market: str, limit: int = 120) -> List[float]:
     return []
 
 # ============================================================
-# Bot engine
+# Engine
 # ============================================================
 
 class Engine:
     def __init__(self):
         self.lock = threading.Lock()
+
         self.state = read_json(STATE_FILE, {})
         self.positions: List[Position] = []
         self.trades: List[Trade] = []
         self.equity_series: List[dict] = []
-        self.pet: Pet = Pet()
 
-        # Load persisted
-        self._load()
+        raw_pet = read_json(PET_FILE, {})
+        try:
+            self.pet: Pet = Pet(**raw_pet) if isinstance(raw_pet, dict) and raw_pet else Pet()
+        except Exception:
+            self.pet = Pet()
 
-        # Ensure baseline
+        self._load_positions()
+        self._load_trades()
+        self._load_equity()
+
         if "equity_usd" not in self.state:
             self.state["equity_usd"] = float(START_EQUITY)
-        self.last_heartbeat_utc = ""
 
-        # Stats
         self.total_trades = int(self.state.get("total_trades", 0))
         self.wins = int(self.state.get("wins", 0))
         self.losses = int(self.state.get("losses", 0))
         self.total_pnl = float(self.state.get("total_pnl_usd", 0.0))
 
-    def _load(self):
-        # positions
-        raw_positions = read_json(STATE_FILE, {}).get("positions", [])
+        self.last_heartbeat_utc = ""
+
+    def _load_positions(self):
+        raw_positions = self.state.get("positions", [])
         if isinstance(raw_positions, list):
             for p in raw_positions:
                 if isinstance(p, dict):
@@ -282,7 +282,7 @@ class Engine:
                     except Exception:
                         pass
 
-        # trades
+    def _load_trades(self):
         raw_trades = read_json(TRADES_FILE, [])
         if isinstance(raw_trades, list):
             for t in raw_trades[-200:]:
@@ -292,21 +292,12 @@ class Engine:
                     except Exception:
                         pass
 
-        # equity series
+    def _load_equity(self):
         raw_eq = read_json(EQUITY_FILE, [])
         if isinstance(raw_eq, list):
             self.equity_series = raw_eq[-500:]
 
-        # pet
-        raw_pet = read_json(PET_FILE, {})
-        if isinstance(raw_pet, dict) and raw_pet:
-            try:
-                self.pet = Pet(**raw_pet)
-            except Exception:
-                self.pet = Pet()
-
     def _persist(self):
-        # Persist state + positions
         s = dict(self.state)
         s["equity_usd"] = float(s.get("equity_usd", START_EQUITY))
         s["positions"] = [asdict(p) for p in self.positions]
@@ -314,8 +305,8 @@ class Engine:
         s["wins"] = self.wins
         s["losses"] = self.losses
         s["total_pnl_usd"] = self.total_pnl
-        write_json(STATE_FILE, s)
 
+        write_json(STATE_FILE, s)
         write_json(TRADES_FILE, [asdict(t) for t in self.trades][-500:])
         write_json(EQUITY_FILE, self.equity_series[-500:])
         write_json(PET_FILE, asdict(self.pet))
@@ -325,41 +316,27 @@ class Engine:
         self.equity_series.append({"equity_usd": eq, "time_utc": utc_now_iso()})
         self.equity_series = self.equity_series[-500:]
 
-    def _pet_tick(self):
-        """
-        Pet is tied to performance:
-          - wins reduce hunger and increase growth
-          - losses increase hunger and reduce health
-          - if total_pnl goes positive -> pet can hatch and improve mood
-        Also pet influences risk: when faint/sad -> reduce risk to protect it.
-        """
-        now = utc_now_iso()
-        self.pet.last_update_utc = now
+    # ---------- Pet logic ----------
 
-        # natural decay: gets a bit hungrier over time
+    def _pet_tick(self):
+        self.pet.last_update_utc = utc_now_iso()
         self.pet.hunger = clamp(self.pet.hunger + 1.5, 0.0, 100.0)
 
-        # health depends on hunger
         if self.pet.hunger > 85:
             self.pet.health = clamp(self.pet.health - 2.0, 0.0, 100.0)
         elif self.pet.hunger < 40:
             self.pet.health = clamp(self.pet.health + 0.6, 0.0, 100.0)
 
-        # Mood
         if self.pet.health <= 10:
             self.pet.mood = "sad"
         elif self.pet.health <= 30:
             self.pet.mood = "ok"
-        elif self.pet.health <= 70:
-            self.pet.mood = "happy"
         else:
             self.pet.mood = "happy"
 
-        # Fainted logic
         if self.pet.health <= 0:
             self.pet.fainted = True
 
-        # Hatch when total pnl is positive
         if (not self.pet.fainted) and self.pet.stage == "egg" and self.total_pnl > 0:
             self.pet.stage = "hatched"
             self.pet.growth = 10.0
@@ -378,11 +355,6 @@ class Engine:
             self.pet.fainted = True
 
     def effective_risk_multiplier(self) -> float:
-        """
-        Pet makes the bot act "responsible":
-          - If pet is fainted or low health -> risk down
-          - If pet is healthy -> normal
-        """
         if self.pet.fainted:
             return 0.0
         if self.pet.health < 20:
@@ -391,19 +363,9 @@ class Engine:
             return 0.5
         return 1.0
 
-    def win_rate(self) -> float:
-        total = self.wins + self.losses
-        return (self.wins / total) * 100.0 if total > 0 else 0.0
-
-    # ---------------------------
-    # Strategy
-    # ---------------------------
+    # ---------- Strategy ----------
 
     def generate_signal(self, market: str, closes: List[float]) -> Tuple[str, float, str]:
-        """
-        Returns: (action, confidence, reason)
-          action: "BUY" or "HOLD"
-        """
         if len(closes) < max(RSI_PERIOD + 1, SMA_SLOW + 1):
             return ("HOLD", 0.0, "not_enough_data")
 
@@ -416,44 +378,38 @@ class Engine:
         last = closes[-1]
         trend_up = f > s
 
-        # Confidence scoring (simple but stable)
         conf = 0.50
-        reason_bits = []
-
+        bits = []
         if trend_up:
             conf += 0.10
-            reason_bits.append("trend_up")
+            bits.append("trend_up")
         else:
             conf -= 0.08
-            reason_bits.append("trend_down")
+            bits.append("trend_down")
 
         if r < 35:
             conf += 0.10
-            reason_bits.append("rsi_oversold")
+            bits.append("rsi_oversold")
         elif r > 70:
             conf -= 0.12
-            reason_bits.append("rsi_overbought")
+            bits.append("rsi_overbought")
 
-        # Keep within bounds
         conf = clamp(conf, 0.0, 1.0)
 
         if trend_up and r < 60 and conf >= MIN_CONFIDENCE:
-            return ("BUY", conf, "|".join(reason_bits) + f"|rsi={r:.1f}|px={last:.2f}")
+            return ("BUY", conf, "|".join(bits) + f"|rsi={r:.1f}|px={last:.2f}")
+        return ("HOLD", conf, "|".join(bits) + f"|rsi={r:.1f}|px={last:.2f}")
 
-        return ("HOLD", conf, "|".join(reason_bits) + f"|rsi={r:.1f}|px={last:.2f}")
-
-    # ---------------------------
-    # Position management
-    # ---------------------------
+    # ---------- Positions ----------
 
     def open_position(self, market: str, price: float, confidence: float, reason: str):
         if self.pet.fainted:
             return
-
         if len(self.positions) >= MAX_OPEN_POSITIONS:
             return
+        if any(p.market == market for p in self.positions):
+            return
 
-        # Risk scales down when pet is weak
         risk_mult = self.effective_risk_multiplier()
         if risk_mult <= 0:
             return
@@ -462,16 +418,13 @@ class Engine:
         risk_pct = RISK_PER_TRADE_PCT * risk_mult
         risk_usd = equity * (risk_pct / 100.0)
 
-        # Use SL distance to size position (very simple sizing)
         sl = price * (1.0 - STOP_LOSS_PCT / 100.0)
         tp = price * (1.0 + TAKE_PROFIT_PCT / 100.0)
-        sl_dist = max(price - sl, 0.0000001)
+        sl_dist = max(price - sl, 1e-9)
 
-        # "size_usd" is amount of equity allocated, capped
-        # (This is paper-trading logic, not real exchange sizing)
         size_usd = clamp(risk_usd * (price / sl_dist), 5.0, equity * 0.25)
 
-        pos = Position(
+        self.positions.append(Position(
             market=market,
             side="LONG",
             entry_price=float(price),
@@ -481,14 +434,12 @@ class Engine:
             opened_time_utc=utc_now_iso(),
             confidence=float(confidence),
             reason=reason,
-            pnl_usd=None,
-        )
-        self.positions.append(pos)
-        log.info(f"OPEN {market} LONG size_usd={size_usd:.2f} entry={price:.2f} sl={sl:.2f} tp={tp:.2f} conf={confidence:.2f}")
+        ))
+
+        log.info(f"OPEN {market} size=${size_usd:.2f} entry={price:.2f} sl={sl:.2f} tp={tp:.2f} conf={confidence:.2f}")
 
     def close_position(self, idx: int, price: float, why: str):
         pos = self.positions[idx]
-        # PnL in USD approx: (price - entry) / entry * size_usd
         pnl = ((price - pos.entry_price) / pos.entry_price) * pos.size_usd
 
         self.total_pnl += pnl
@@ -498,34 +449,24 @@ class Engine:
         else:
             self.losses += 1
 
-        # Update equity
         self.state["equity_usd"] = float(self.state.get("equity_usd", START_EQUITY)) + pnl
-
-        # Record trade
         self.trades.append(Trade(market=pos.market, side="SELL", pnl_usd=float(pnl), time=utc_now_iso()))
         self.trades = self.trades[-200:]
 
-        # Pet reacts
         self._pet_on_trade(pnl)
 
         log.info(f"CLOSE {pos.market} pnl={pnl:.2f} ({why}) equity={self.state['equity_usd']:.2f}")
-
-        # Remove
         self.positions.pop(idx)
 
-    # ---------------------------
-    # Main cycle
-    # ---------------------------
+    # ---------- Cycle ----------
 
     def run_cycle(self):
         with self.lock:
             self._pet_tick()
 
-        # Fetch prices (best effort)
         prices = fetch_prices_from_api(MARKETS)
 
         with self.lock:
-            # Mark-to-market and check exits
             for i in range(len(self.positions) - 1, -1, -1):
                 pos = self.positions[i]
                 px = prices.get(pos.market)
@@ -536,29 +477,25 @@ class Engine:
                 elif px >= pos.take_price:
                     self.close_position(i, px, "take_profit")
 
-        # If no API prices available, just persist + idle safely
         if not prices:
             with self.lock:
                 self._log_equity_point()
                 self.last_heartbeat_utc = utc_now_iso()
                 self._persist()
-            log.info("No prices available from API. Bot idling safely.")
+            log.info("No prices from API -> idling safely.")
             return
 
-        # For each market, generate signal (history best-effort)
         for m in MARKETS:
             if m not in prices:
                 continue
+
             closes = fetch_history_from_api(m, limit=180)
             if not closes:
-                # fallback: create tiny history from current price (prevents crashes)
                 closes = [prices[m]] * (SMA_SLOW + RSI_PERIOD + 2)
 
             action, confidence, reason = self.generate_signal(m, closes)
-
             with self.lock:
-                already_open = any(p.market == m for p in self.positions)
-                if action == "BUY" and (not already_open) and confidence >= MIN_CONFIDENCE:
+                if action == "BUY" and confidence >= MIN_CONFIDENCE:
                     self.open_position(m, prices[m], confidence, reason)
 
         with self.lock:
@@ -568,29 +505,9 @@ class Engine:
 
     def snapshot_for_api(self) -> dict:
         with self.lock:
-            equity = float(self.state.get("equity_usd", START_EQUITY))
             total = self.wins + self.losses
             win_rate = (self.wins / total) * 100.0 if total > 0 else 0.0
             avg_pnl = (self.total_pnl / total) if total > 0 else 0.0
-
-            # Per-market stats (simple)
-            market_stats = []
-            for m in MARKETS:
-                mt = [t for t in self.trades if t.market == m]
-                if mt:
-                    mw = len([t for t in mt if t.pnl_usd >= 0])
-                    ml = len(mt) - mw
-                    mp = sum(t.pnl_usd for t in mt)
-                    market_stats.append({
-                        "market": m,
-                        "trades": len(mt),
-                        "win_rate": (mw / len(mt)) * 100.0,
-                        "avg_pnl": mp / len(mt),
-                        "total_pnl": mp
-                    })
-
-            # Recent trades
-            recent = [asdict(t) for t in self.trades[-25:]][::-1]
 
             return {
                 "equity_series": self.equity_series[-300:],
@@ -599,4 +516,83 @@ class Engine:
                 "losses": self.losses,
                 "win_rate": round(win_rate, 2),
                 "avg_pnl": round(avg_pnl, 4),
-                "
+                "total_pnl_usd": round(self.total_pnl, 6),
+                "open_positions": [asdict(p) for p in self.positions],
+                "recent_trades": [asdict(t) for t in self.trades[-25:]][::-1],
+                "bot_status": {
+                    "running": True,
+                    "last_heartbeat_utc": self.last_heartbeat_utc,
+                    "api_url": API_URL,
+                },
+                "pet": asdict(self.pet),
+            }
+
+# ============================================================
+# Dashboard loader (no more triple-quoted HTML in Python)
+# ============================================================
+
+def load_dashboard_html() -> bytes:
+    try:
+        with open(DASHBOARD_PATH, "rb") as f:
+            return f.read()
+    except Exception as e:
+        log.error(f"dashboard.html missing or unreadable: {e}")
+        return b"<h1>dashboard.html not found</h1>"
+
+# ============================================================
+# Web server routes
+# ============================================================
+
+ENGINE = Engine()
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, content_type: str = "text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/" or self.path.startswith("/?"):
+            self._send(200, load_dashboard_html(), "text/html; charset=utf-8")
+            return
+
+        if self.path == "/health":
+            self._send(200, b"OK", "text/plain; charset=utf-8")
+            return
+
+        if self.path == "/data":
+            data = ENGINE.snapshot_for_api()
+            self._send(200, json.dumps(data).encode("utf-8"), "application/json; charset=utf-8")
+            return
+
+        self._send(404, b"Not Found", "text/plain; charset=utf-8")
+
+    def log_message(self, fmt, *args):
+        return
+
+# ============================================================
+# Main
+# ============================================================
+
+def bot_loop():
+    log.info(f"Bot starting. markets={MARKETS} cycle={CYCLE_SECONDS}s api_url={API_URL or '(none)'}")
+    while True:
+        try:
+            ENGINE.run_cycle()
+        except Exception as e:
+            err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            log.error(f"Cycle crashed: {e}\n{err}")
+        time.sleep(CYCLE_SECONDS)
+
+def main():
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    log.info(f"Web server listening on :{PORT}")
+    server.serve_forever()
+
+if __name__ == "__main__":
+    main()
