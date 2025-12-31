@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Crypto AI Bot Dashboard</title>
+</head>
+<body style="background:#0b1220;color:#e6edf3;font-family:Arial">
+  <h1>Crypto AI Bot</h1>
+  <p>Status dashboard</p>
+  <pre id="out">Loading…</pre>
+
+<script>
+async function load() {
+  const r = await fetch('/data');
+  const d = await r.json();
+  document.getElementById('out').textContent =
+    JSON.stringify(d, null, 2);
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
