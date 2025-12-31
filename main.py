@@ -420,7 +420,7 @@ def main():
     log_equity(float(state["equity_usd"]), {"note": "startup"})
 
     while True:
-          try:
+    try:
         log.info("Bot cycle running")
 
         heartbeat("running", {
@@ -432,7 +432,7 @@ def main():
         run_cycle(state, positions)
         save_state(state, positions)
 
-           except Exception as e:
+    except Exception as e:
         err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         heartbeat("error", {"message": str(e)})
         log_event("error", {"message": str(e), "traceback": err})
