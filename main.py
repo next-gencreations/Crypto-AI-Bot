@@ -1,4 +1,4 @@
-import os
+9import os
 import json
 import time
 import math
@@ -514,15 +514,23 @@ def main() -> None:
                 "equity_usd": float(state.get("equity_usd", START_EQUITY))
             })
 
-            log.info(f"Cycle running | equity=${state.get('equity_usd')} | open_positions={len(positions)}")
+            log.info(
+                f"Cycle running | equity=${state.get('equity_usd')} | "
+                f"open_positions={len(positions)}"
+            )
 
             positions = run_cycle(state, positions)
             save_state(state, positions)
 
         except Exception as e:
-            err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            err = "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)
+            )
             heartbeat("error", {"message": str(e)})
-            log_event("error", {"message": str(e), "traceback": err})
+            log_event("error", {
+                "message": str(e),
+                "traceback": err
+            })
             log.error(f"Cycle crashed: {e}")
 
         time.sleep(CYCLE_SECONDS)
