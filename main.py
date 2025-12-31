@@ -420,7 +420,7 @@ def main():
     log_equity(float(state["equity_usd"]), {"note": "startup"})
 
     while True:
-    try:
+          try:
         log.info("Bot cycle running")
 
         heartbeat("running", {
