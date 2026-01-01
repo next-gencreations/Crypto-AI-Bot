@@ -50,16 +50,16 @@ def clamp(x: float, lo: float, hi: float) -> float:
 # Config
 # ============================================================
 
-# API_URL = internal Render URL to your crypto-ai-api web service
-# Example (internal): http://crypto-ai-api-h921:10000
+# IMPORTANT:
+# - API_URL should be Render INTERNAL URL for the API service:
+#   http://crypto-ai-api-h921:10000
 API_URL = env_str("API_URL", "").rstrip("/")
 
-# PRICE_API_BASE is OPTIONAL and editable:
-# If set, prices/history will be loaded from PRICE_API_BASE
-# Otherwise bot falls back to API_URL
+# Optional separate market data base (if set, bot reads /prices and /history from there)
+# If empty, it will use API_URL for /prices and /history.
 PRICE_API_BASE = env_str("PRICE_API_BASE", "").rstrip("/")
 
-MARKETS = [m.strip().upper() for m in env_str("MARKETS", "BTC-USD,ETH-USD").split(",") if m.strip()]
+MARKETS = [m.strip() for m in env_str("MARKETS", "BTC-USD,ETH-USD").split(",") if m.strip()]
 CYCLE_SECONDS = env_int("CYCLE_SECONDS", 360)
 
 START_EQUITY = env_float("START_EQUITY", 1000.0)
@@ -71,11 +71,11 @@ SMA_FAST = env_int("SMA_FAST", 10)
 SMA_SLOW = env_int("SMA_SLOW", 30)
 
 # risk
-RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 0.5)
+RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 0.5)  # % equity at risk per trade (baseline)
 STOP_LOSS_PCT = env_float("STOP_LOSS_PCT", 0.8)
 TAKE_PROFIT_PCT = env_float("TAKE_PROFIT_PCT", 1.2)
 
-# baseline thresholds (adapts with hunger)
+# baseline thresholds (will adapt based on "hunger")
 MIN_CONFIDENCE = env_float("MIN_CONFIDENCE", 0.58)
 
 # ============================================================
@@ -116,12 +116,12 @@ class Trade:
 
 @dataclass
 class Pet:
-    stage: str = "egg"
+    stage: str = "egg"            # egg -> hatched
     mood: str = "sleepy"
-    health: float = 100.0
-    hunger: float = 60.0
-    growth: float = 0.0
-    fainted_until_utc: str = ""
+    health: float = 100.0         # 0..100
+    hunger: float = 60.0          # 0..100 (higher = hungrier)
+    growth: float = 0.0           # 0..100
+    fainted_until_utc: str = ""   # timeout timestamp (pet can't die permanently)
     last_update_utc: str = ""
 
 # ============================================================
@@ -199,9 +199,9 @@ def volatility(values: List[float], period: int = 30) -> float:
 
 # ============================================================
 # Price feed
-# Expects your API service provides:
-#   GET {BASE}/prices
-#   GET {BASE}/history?market=BTC-USD&limit=180
+# Expected:
+#   GET {BASE}/prices -> {"BTC-USD": 123, ...}
+#   GET {BASE}/history?market=BTC-USD&limit=180 -> {"closes":[...]}
 # ============================================================
 
 def price_base() -> str:
@@ -211,7 +211,8 @@ def fetch_prices(markets: List[str]) -> Dict[str, float]:
     base = price_base()
     if not base:
         return {}
-    bulk = http_get_json(f"{base}/prices")
+    url = f"{base}/prices"
+    bulk = http_get_json(url)
     out: Dict[str, float] = {}
     if isinstance(bulk, dict):
         for m in markets:
@@ -267,22 +268,18 @@ class Engine:
 
     def _set_faint_timeout_minutes(self, minutes: int):
         until = datetime.now(timezone.utc).timestamp() + minutes * 60
-        until_iso = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
-        self.pet.fainted_until_utc = until_iso
+        self.pet.fainted_until_utc = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
 
     def _pet_tick(self):
         self.pet.last_update_utc = utc_now_iso()
 
-        # hunger rises every cycle
         self.pet.hunger = clamp(self.pet.hunger + 2.0, 0.0, 100.0)
 
-        # health reacts to hunger (never permanent death)
         if self.pet.hunger > 85:
             self.pet.health = clamp(self.pet.health - 2.0, 0.0, 100.0)
         elif self.pet.hunger < 40:
             self.pet.health = clamp(self.pet.health + 0.6, 0.0, 100.0)
 
-        # mood
         if self._is_fainted():
             self.pet.mood = "dizzy"
         elif self.pet.health < 25:
@@ -292,11 +289,9 @@ class Engine:
         else:
             self.pet.mood = "focused"
 
-        # hatch when it proves itself
         if self.pet.stage == "egg" and (self.total_pnl > 0 or self.wins >= 5):
             self.pet.stage = "hatched"
             self.pet.growth = max(self.pet.growth, 10.0)
-            self._emit_event("status", "pet_hatched", {"growth": self.pet.growth})
 
     def _pet_on_trade(self, pnl: float):
         if pnl > 0:
@@ -309,7 +304,6 @@ class Engine:
             self.pet.health = clamp(self.pet.health - 4.0, 0.0, 100.0)
             self._emit_sound("whimper", {"pnl": pnl})
 
-            # faint timeout (cooldown), but bot still trades small
             if self.pet.health <= 10 and not self._is_fainted():
                 self._set_faint_timeout_minutes(20)
                 self._emit_event("status", "pet_fainted_timeout", {"minutes": 20})
@@ -371,14 +365,14 @@ class Engine:
 
     def score_market(self, market: str, closes: List[float]) -> Tuple[float, float, str, dict]:
         if len(closes) < max(RSI_PERIOD + 1, SMA_SLOW + 1):
-            return (0.0, 0.0, "not_enough_data", {"rsi": None, "trend_strength": 0.0, "vol": 0.0})
+            return (0.0, 0.0, "not_enough_data", {"rsi": None, "trend": 0.0, "vol": 0.0})
 
         r = rsi(closes, RSI_PERIOD)
         f = sma(closes, SMA_FAST)
         s = sma(closes, SMA_SLOW)
         vol = volatility(closes, period=30)
         if r is None or f is None or s is None:
-            return (0.0, 0.0, "indicator_unavailable", {"rsi": None, "trend_strength": 0.0, "vol": vol})
+            return (0.0, 0.0, "indicator_unavailable", {"rsi": None, "trend": 0.0, "vol": vol})
 
         last = closes[-1]
         trend = 1.0 if f > s else -1.0
@@ -532,7 +526,6 @@ class Engine:
             log.info("No prices -> idling safely.")
             return
 
-        # 1) manage open positions
         with self.lock:
             for i in range(len(self.positions) - 1, -1, -1):
                 pos = self.positions[i]
@@ -544,7 +537,6 @@ class Engine:
                 elif px >= pos.take_price:
                     self.close_position(i, px, "take_profit", {"rsi": 0.0, "trend_strength": 0.0, "vol": 0.0})
 
-        # 2) score markets
         scored: List[Tuple[float, str, float, str, dict]] = []
         for m in MARKETS:
             closes = fetch_history(m, limit=180)
@@ -580,10 +572,9 @@ class Engine:
                     "best_edge": (best[0] if best else None),
                 })
 
-        # 3) push state
         self.push_state(prices_ok=True)
 
-    # ---------------- Push state ----------------
+    # ---------------- Push state to API ----------------
 
     def push_state(self, prices_ok: bool):
         self.last_heartbeat_utc = utc_now_iso()
@@ -601,7 +592,6 @@ class Engine:
                 "total_pnl_usd": self.total_pnl,
                 "survival_mode": self.survival_mode(),
                 "prices_ok": prices_ok,
-                "price_base": price_base(),
             })
 
             http_post_json(f"{API_URL}/ingest/equity", {
@@ -622,11 +612,14 @@ class Engine:
 ENGINE = Engine()
 
 def bot_loop():
-    log.info(f"Bot starting. API_URL={API_URL or '(none)'} PRICE_API_BASE={PRICE_API_BASE or '(none)'}")
-    log.info(f"Markets={MARKETS} cycle={CYCLE_SECONDS}s")
+    log.info("Bot starting...")
+    log.info(f"API_URL={API_URL or '(empty)'}")
+    log.info(f"PRICE_BASE={price_base() or '(empty)'}")
+    log.info(f"MARKETS={MARKETS}")
+    log.info(f"CYCLE_SECONDS={CYCLE_SECONDS}")
 
     if not API_URL:
-        log.warning("API_URL is empty. Set API_URL to your Render internal URL like: http://crypto-ai-api-h921:10000")
+        log.warning("API_URL is empty. Set API_URL to: http://crypto-ai-api-h921:10000")
 
     while True:
         try:
