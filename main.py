@@ -2,9 +2,7 @@ import time
 import random
 import requests
 import logging
-import json
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from datetime import datetime
 
 # =========================
 # CONFIG
@@ -12,12 +10,11 @@ from pathlib import Path
 
 API_URL = "https://crypto-ai-api-1-7cte.onrender.com"
 CYCLE_SECONDS = 30
+DEATH_PAUSE_SECONDS = 600  # 10 minutes
 
 START_EQUITY = 1000.0
-RISK_PER_TRADE = 0.01
-
-COOLDOWN_MINUTES = 10
-DEATH_LOG_PATH = Path("death_log.jsonl")  # saved alongside main.py
+BASE_RISK_PER_TRADE = 0.01
+MIN_RISK = 0.002
 
 # =========================
 # LOGGING
@@ -34,28 +31,21 @@ log = logging.getLogger("Crypto-AI-Bot")
 # STATE
 # =========================
 
-def utc_now():
-    return datetime.now(timezone.utc)
-
 state = {
     "equity": START_EQUITY,
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
-    "rebirth_count": 0,
-    "risk_multiplier": 1.0,     # reduces after deaths to "learn not to die"
-    "cooldown_until": None,     # ISO timestamp
-    "halt_logged": False,       # prevents spam death logs
+    "risk_per_trade": BASE_RISK_PER_TRADE,
+    "generation": 1,
     "pet": {
-        "name": "TradePet",
-        "stage": "egg",         # egg -> (later you can evolve)
+        "stage": "egg",        # egg | alive | dead
         "health": 100,
-        "mood": "neutral",
         "hunger": 0,
+        "mood": "neutral",
         "alive": True,
-        "last_update": None,
-        "last_death_reason": None,
-        "last_death_time": None
+        "birth_time": None,
+        "last_update": None
     }
 }
 
@@ -71,94 +61,63 @@ def post(endpoint, payload):
         log.warning(f"API error {endpoint}: {e}")
         return False
 
-def safe_post(endpoint, payload):
-    """Post but never crash the loop if API doesn't have that endpoint."""
-    try:
-        requests.post(f"{API_URL}{endpoint}", json=payload, timeout=10)
-    except Exception:
-        pass
-
 # =========================
-# DEATH / COOLDOWN HELPERS
+# PET LIFECYCLE
 # =========================
 
-def log_death(death_report: dict):
-    try:
-        DEATH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with DEATH_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(death_report, ensure_ascii=False) + "\n")
-    except Exception as e:
-        log.warning(f"Could not write death log: {e}")
+def hatch_pet():
+    state["pet"] = {
+        "stage": "alive",
+        "health": 100,
+        "hunger": 0,
+        "mood": "curious",
+        "alive": True,
+        "birth_time": datetime.utcnow().isoformat(),
+        "last_update": datetime.utcnow().isoformat()
+    }
+    log.info("🥚➡️🐣 Pet hatched. New life begins.")
 
-def build_death_report(reason: str, pnl: float = None, err: Exception = None):
-    pet = state["pet"]
-    win_rate = (state["wins"] / state["total_trades"]) if state["total_trades"] else 0.0
+def kill_pet(reason):
+    state["pet"]["alive"] = False
+    state["pet"]["stage"] = "dead"
+    state["pet"]["mood"] = "dead"
 
-    report = {
-        "time_utc": utc_now().isoformat(),
-        "reason": reason,
-        "error": str(err) if err else None,
-        "equity_usd": state["equity"],
+    death_report = {
+        "time": datetime.utcnow().isoformat(),
+        "generation": state["generation"],
+        "equity": state["equity"],
         "wins": state["wins"],
         "losses": state["losses"],
-        "total_trades": state["total_trades"],
-        "win_rate": win_rate,
-        "risk_multiplier": state.get("risk_multiplier", 1.0),
-        "pet": {
-            "name": pet.get("name"),
-            "stage": pet.get("stage"),
-            "health": pet.get("health"),
-            "hunger": pet.get("hunger"),
-            "mood": pet.get("mood"),
-            "alive": pet.get("alive")
-        },
-        "last_trade": {
-            "pnl": pnl,
-            "timestamp": utc_now().isoformat()
-        } if pnl is not None else None
+        "risk_per_trade": state["risk_per_trade"],
+        "reason": reason
     }
-    return report
 
-def set_cooldown(minutes: int):
-    state["cooldown_until"] = (utc_now() + timedelta(minutes=minutes)).isoformat()
+    log.error(f"💀 Pet died. Reason: {reason}")
+    post("/ingest/death", death_report)
 
-def in_cooldown():
-    s = state.get("cooldown_until")
-    if not s:
-        return False
-    try:
-        until = datetime.fromisoformat(s)
-        return utc_now() < until
-    except Exception:
-        return False
+def rebirth():
+    state["generation"] += 1
+    state["equity"] = max(START_EQUITY * 0.9, state["equity"])
+    state["wins"] = 0
+    state["losses"] = 0
+    state["total_trades"] = 0
 
-def rebirth_to_egg(reason: str):
-    pet = state["pet"]
+    # Reduce risk after death (learning)
+    state["risk_per_trade"] = max(
+        MIN_RISK,
+        state["risk_per_trade"] * 0.8
+    )
 
-    # store last death info for dashboard
-    pet["last_death_reason"] = reason
-    pet["last_death_time"] = utc_now().isoformat()
+    state["pet"]["stage"] = "egg"
+    state["pet"]["alive"] = True
 
-    # "learn": reduce risk a bit each death (floor it)
-    state["risk_multiplier"] = max(0.25, float(state.get("risk_multiplier", 1.0)) * 0.85)
-    state["rebirth_count"] = int(state.get("rebirth_count", 0)) + 1
-
-    # reset pet to egg baseline
-    pet["stage"] = "egg"
-    pet["health"] = 100
-    pet["hunger"] = 0
-    pet["mood"] = "hopeful"
-    pet["alive"] = True
-    pet["last_update"] = utc_now().isoformat()
-
-    # cooldown
-    set_cooldown(COOLDOWN_MINUTES)
-
-    # reset the spam-guard
-    state["halt_logged"] = False
+    log.info(
+        f"🔁 Rebirth complete | Generation {state['generation']} | "
+        f"New risk: {state['risk_per_trade']:.4f}"
+    )
 
 # =========================
-# PET LOGIC
+# PET UPDATE
 # =========================
 
 def update_pet(pnl):
@@ -167,33 +126,39 @@ def update_pet(pnl):
     pet["hunger"] += 5
 
     if pnl > 0:
-        pet["health"] = min(100, pet["health"] + 5)
+        pet["health"] = min(100, pet["health"] + 4)
+        pet["hunger"] = max(0, pet["hunger"] - 8)
         pet["mood"] = "happy"
-        pet["hunger"] = max(0, pet["hunger"] - 10)
     else:
-        pet["health"] -= 5
-        pet["mood"] = "sad"
+        pet["health"] -= 6
+        pet["mood"] = "stressed"
 
-    if pet["hunger"] > 80:
-        pet["health"] -= 5
+    if pet["hunger"] > 85:
+        pet["health"] -= 8
+
+    pet["last_update"] = datetime.utcnow().isoformat()
 
     if pet["health"] <= 0:
-        pet["alive"] = False
-        pet["mood"] = "dead"
-
-    pet["last_update"] = utc_now().isoformat()
+        reason = "starvation" if pet["hunger"] > 85 else "losses"
+        kill_pet(reason)
 
 # =========================
-# TRADING LOGIC (SAFE SIM)
+# TRADING LOGIC (SURVIVAL FIRST)
 # =========================
 
 def simulate_trade():
-    # adaptive risk (learn not to die)
-    risk_mult = float(state.get("risk_multiplier", 1.0))
-    risk = state["equity"] * RISK_PER_TRADE * risk_mult
+    equity = state["equity"]
+    risk = equity * state["risk_per_trade"]
 
-    win = random.random() > 0.45
-    pnl = risk * random.uniform(0.8, 1.5) if win else -risk
+    # Conservative bias: avoid trades if equity is fragile
+    if equity < START_EQUITY * 0.8:
+        log.warning("⚠️ Equity low. Skipping trade to survive.")
+        return 0.0
+
+    win_chance = 0.52 if state["risk_per_trade"] < BASE_RISK_PER_TRADE else 0.48
+    win = random.random() < win_chance
+
+    pnl = risk * random.uniform(0.6, 1.3) if win else -risk
 
     state["equity"] += pnl
     state["total_trades"] += 1
@@ -206,42 +171,6 @@ def simulate_trade():
     return pnl
 
 # =========================
-# API PUSH
-# =========================
-
-def push_updates(pnl=None):
-    # heartbeat
-    post("/ingest/heartbeat", {
-        "time": utc_now().isoformat(),
-        "equity": state["equity"],
-        "status": "cooldown" if in_cooldown() else "running",
-        "cooldown_until": state.get("cooldown_until"),
-        "rebirth_count": state.get("rebirth_count", 0)
-    })
-
-    # pet
-    post("/ingest/pet", state["pet"])
-
-    # equity
-    post("/ingest/equity", {
-        "equity_usd": state["equity"],
-        "time_utc": utc_now().isoformat()
-    })
-
-    # optional trade
-    if pnl is not None:
-        post("/ingest/trade", {
-            "pnl": pnl,
-            "equity": state["equity"],
-            "timestamp": utc_now().isoformat()
-        })
-
-    # prices (fake)
-    post("/ingest/prices", {
-        "BTCUSDT": random.uniform(30000, 60000)
-    })
-
-# =========================
 # MAIN LOOP
 # =========================
 
@@ -249,66 +178,52 @@ def run():
     log.info("🚀 Crypto-AI-Bot started")
 
     while True:
-        try:
-            # COOLDOWN MODE (no trading)
-            if in_cooldown():
-                # keep UI alive and show countdown
-                log.info(f"⏸️ Cooldown active until {state['cooldown_until']} (no trading)")
-                state["pet"]["mood"] = "resting"
-                state["pet"]["last_update"] = utc_now().isoformat()
-                push_updates(pnl=None)
-                time.sleep(CYCLE_SECONDS)
-                continue
 
-            # if pet is dead, do post-mortem + rebirth + cooldown
-            if not state["pet"]["alive"]:
-                reason = "health<=0"
+        # Egg phase
+        if state["pet"]["stage"] == "egg":
+            hatch_pet()
 
-                # log death ONCE
-                if not state.get("halt_logged"):
-                    report = build_death_report(reason=reason)
-                    log_death(report)
-                    log.error("💀 Pet died. Logging death + rebirth to egg + cooldown 10 mins.")
+        # Death handling
+        if not state["pet"]["alive"]:
+            log.error("⏸️ Trading paused. Analysing death.")
+            time.sleep(DEATH_PAUSE_SECONDS)
+            rebirth()
+            continue
 
-                    # (optional) send death event if your API has it (won't break if it doesn't)
-                    safe_post("/ingest/death", report)
+        pnl = simulate_trade()
+        update_pet(pnl)
 
-                    state["halt_logged"] = True
+        log.info(
+            f"Gen {state['generation']} | "
+            f"Trade #{state['total_trades']} | "
+            f"PnL: {pnl:.2f} | "
+            f"Equity: {state['equity']:.2f} | "
+            f"HP: {state['pet']['health']} | "
+            f"Risk: {state['risk_per_trade']:.4f}"
+        )
 
-                rebirth_to_egg(reason=reason)
-                push_updates(pnl=None)
-                time.sleep(2)
-                continue
+        # -------------------------
+        # API REPORTING
+        # -------------------------
 
-            # NORMAL TRADE
-            pnl = simulate_trade()
-            update_pet(pnl)
+        post("/ingest/heartbeat", {
+            "time": datetime.utcnow().isoformat(),
+            "equity": state["equity"],
+            "generation": state["generation"]
+        })
 
-            log.info(
-                f"Trade #{state['total_trades']} | "
-                f"PnL: {pnl:.2f} | "
-                f"Equity: {state['equity']:.2f} | "
-                f"Pet HP: {state['pet']['health']} | "
-                f"RiskMult: {state.get('risk_multiplier', 1.0):.2f}"
-            )
+        post("/ingest/pet", state["pet"])
 
-            # If this trade killed the pet, handle next loop (but also push now)
-            push_updates(pnl=pnl)
+        post("/ingest/trade", {
+            "pnl": pnl,
+            "equity": state["equity"],
+            "wins": state["wins"],
+            "losses": state["losses"],
+            "risk_per_trade": state["risk_per_trade"],
+            "timestamp": datetime.utcnow().isoformat()
+        })
 
-            time.sleep(CYCLE_SECONDS)
-
-        except Exception as e:
-            # Treat unexpected exceptions as a "death" too, so you learn from crashes
-            log.exception(f"🔥 Bot exception: {e}")
-
-            report = build_death_report(reason="exception", err=e)
-            log_death(report)
-            safe_post("/ingest/death", report)
-
-            # rebirth + cooldown so it doesn't thrash
-            rebirth_to_egg(reason="exception")
-            push_updates(pnl=None)
-            time.sleep(CYCLE_SECONDS)
+        time.sleep(CYCLE_SECONDS)
 
 # =========================
 # ENTRY
