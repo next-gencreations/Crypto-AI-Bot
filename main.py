@@ -1,11 +1,10 @@
 import os
 import time
-import json
 import random
 import logging
 import traceback
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # =========================
 # CONFIG
@@ -53,7 +52,7 @@ state = {
     "pause_reason": "",
     "paused_until_utc": "",
 
-    # adaptive risk (can reduce after deaths)
+    # adaptive risk (reduces after deaths)
     "risk_per_trade": RISK_PER_TRADE_DEFAULT,
     "death_count": 0,
     "last_death_reason": "",
@@ -61,7 +60,7 @@ state = {
 
     "pet": {
         "name": "TradePet",
-        "stage": "egg",        # egg -> active -> etc (you can expand later)
+        "stage": "active",
         "health": 100.0,
         "mood": "neutral",
         "hunger": 0.0,
@@ -110,28 +109,40 @@ def ingest_event(msg: str, type_: str = "info", details: dict | None = None):
     })
 
 def ingest_death(reason: str, details: dict | None = None):
-    # API must implement /ingest/death for this to persist (safe if missing)
     api_post("/ingest/death", {
         "time_utc": utc_now_iso(),
+        "source": "bot",
         "reason": reason,
         "details": details or {}
     })
 
 def fetch_control():
     """
-    Expected API /control response (example):
-    {
-      "paused": false,
-      "pause_reason": "",
-      "paused_until_utc": ""
-    }
+    /control returns:
+    { "pause_until_utc": "...", "pause_reason": "...", ... }
+    We treat paused=true if now < pause_until_utc.
     """
     data = api_get("/control")
     if not data:
+        state["paused"] = False
+        state["pause_reason"] = ""
+        state["paused_until_utc"] = ""
         return
-    state["paused"] = bool(data.get("paused", False))
-    state["pause_reason"] = str(data.get("pause_reason", "") or "")
-    state["paused_until_utc"] = str(data.get("paused_until_utc", "") or "")
+
+    pause_until = (data.get("pause_until_utc") or "").strip()
+    pause_reason = (data.get("pause_reason") or "").strip()
+
+    paused = False
+    if pause_until:
+        try:
+            until_dt = datetime.fromisoformat(pause_until)
+            paused = datetime.now(timezone.utc) < until_dt
+        except Exception:
+            paused = False
+
+    state["paused"] = paused
+    state["pause_reason"] = pause_reason
+    state["paused_until_utc"] = pause_until
 
 # =========================
 # PET LOGIC
@@ -145,7 +156,9 @@ def set_pet_egg_recovering(until_utc: str, reason: str):
     pet["survival_mode"] = "PAUSED"
     pet["fainted_until_utc"] = until_utc
     pet["time_utc"] = utc_now_iso()
-    ingest_event("🥚 Pet reverted to egg for recovery pause.", "warn", {
+
+    ingest_event("🥚 Pet", "warn", {
+        "action": "revert_to_egg",
         "until_utc": until_utc,
         "reason": reason
     })
@@ -156,18 +169,16 @@ def revive_pet_ready():
     pet["mood"] = "neutral"
     pet["health"] = 100.0
     pet["hunger"] = 0.0
+    pet["growth"] = 0.0
     pet["alive"] = True
     pet["survival_mode"] = "NORMAL"
     pet["fainted_until_utc"] = ""
     pet["time_utc"] = utc_now_iso()
-    ingest_event("✅ Recovery complete. Pet back to active.", "info", {})
+
+    ingest_event("✅ Recovery complete. Pet active.", "info", {})
 
 def update_pet_after_trade(pnl: float):
     pet = state["pet"]
-
-    pet["stage"] = pet.get("stage") or "active"
-    if pet["stage"] == "egg":
-        pet["stage"] = "active"
 
     pet["hunger"] = float(pet.get("hunger", 0.0)) + 5.0
 
@@ -194,20 +205,16 @@ def update_pet_after_trade(pnl: float):
 # =========================
 
 def simulate_trade():
-    """
-    Returns a dict containing trade info.
-    """
     risk = max(1.0, state["equity"] * state["risk_per_trade"])
     market = "BTCUSDT"
     side = "buy" if random.random() > 0.5 else "sell"
     confidence = round(random.uniform(0.35, 0.95), 2)
 
-    # Slight edge/variance
     win = random.random() > 0.45
     pnl = (risk * random.uniform(0.8, 1.5)) if win else (-risk)
 
     price = random.uniform(30000, 60000)
-    size_usd = risk  # simple sizing
+    size_usd = risk
 
     reason = "simulated"
     if confidence < 0.45:
@@ -238,7 +245,7 @@ def apply_trade_result(trade: dict):
         state["losses"] += 1
 
 # =========================
-# SURVIVAL / COOLDOWN
+# COOLDOWN
 # =========================
 
 def in_local_cooldown() -> bool:
@@ -246,24 +253,23 @@ def in_local_cooldown() -> bool:
     if not until:
         return False
     try:
-        until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+        until_dt = datetime.fromisoformat(until)
         return datetime.now(timezone.utc) < until_dt
     except Exception:
         return False
 
 def start_cooldown(reason: str, extra: dict | None = None):
-    # record death
     state["death_count"] += 1
     state["last_death_reason"] = reason
     state["last_death_utc"] = utc_now_iso()
 
-    # “learn”: reduce risk a bit after each death, floor at 0.002 (0.2%)
+    # reduce risk after each death
     state["risk_per_trade"] = max(0.002, state["risk_per_trade"] * 0.8)
 
-    until_dt = datetime.now(timezone.utc) + timedelta_seconds(DEATH_COOLDOWN_SECONDS)
-    until_utc = until_dt.isoformat()
+    until_dt = datetime.now(timezone.utc) + timedelta(seconds=DEATH_COOLDOWN_SECONDS)
+    until_utc = until_dt.replace(microsecond=0).isoformat()
 
-    ingest_event("💀 Pet died / bot failure detected. Entering 10 min recovery pause.", "error", {
+    ingest_event("💀 Failure detected. 10-min recovery pause.", "error", {
         "reason": reason,
         "cooldown_seconds": DEATH_COOLDOWN_SECONDS,
         "new_risk_per_trade": state["risk_per_trade"],
@@ -275,18 +281,19 @@ def start_cooldown(reason: str, extra: dict | None = None):
         **(extra or {})
     })
 
+    # optionally also set API pause so dashboard shows it
+    api_post("/control/pause", {
+        "seconds": DEATH_COOLDOWN_SECONDS,
+        "reason": reason
+    })
+
     set_pet_egg_recovering(until_utc, reason)
 
-def timedelta_seconds(seconds: int):
-    from datetime import timedelta
-    return timedelta(seconds=seconds)
-
 # =========================
-# MAIN LOOP
+# INGEST (one place)
 # =========================
 
 def send_ingest_payloads(trade: dict | None, status: str):
-    # heartbeat
     api_post("/ingest/heartbeat", {
         "time_utc": utc_now_iso(),
         "status": status,
@@ -301,16 +308,13 @@ def send_ingest_payloads(trade: dict | None, status: str):
         "total_pnl_usd": state["total_pnl_usd"],
     })
 
-    # pet
     api_post("/ingest/pet", state["pet"])
 
-    # equity timeline
     api_post("/ingest/equity", {
         "time_utc": utc_now_iso(),
         "equity_usd": state["equity"]
     })
 
-    # trade
     if trade is not None:
         api_post("/ingest/trade", {
             "time_utc": trade["time_utc"],
@@ -323,13 +327,14 @@ def send_ingest_payloads(trade: dict | None, status: str):
             "confidence": trade["confidence"],
         })
 
-    # prices
     api_post("/ingest/prices", {
         "time_utc": utc_now_iso(),
-        "prices": {
-            "BTCUSDT": random.uniform(30000, 60000)
-        }
+        "prices": {"BTCUSDT": random.uniform(30000, 60000)}
     })
+
+# =========================
+# MAIN LOOP
+# =========================
 
 def run():
     log.info("🚀 Crypto-AI-Bot started")
@@ -338,17 +343,11 @@ def run():
         "start_equity": START_EQUITY
     })
 
-    # set initial pet state
-    state["pet"]["stage"] = "active"
-    state["pet"]["time_utc"] = utc_now_iso()
-    api_post("/ingest/pet", state["pet"])
-
     while True:
         try:
-            # 1) Check remote control (pause/resume)
+            # Remote pause control
             fetch_control()
 
-            # 2) If API says paused, honour it
             if state["paused"]:
                 state["pet"]["stage"] = "egg"
                 state["pet"]["mood"] = "paused"
@@ -356,29 +355,30 @@ def run():
                 state["pet"]["time_utc"] = utc_now_iso()
 
                 send_ingest_payloads(trade=None, status="paused")
-                log.info(f"⏸️ PAUSED by control. Reason: {state['pause_reason']}")
+                log.info(f"⏸️ PAUSED by API. Reason: {state['pause_reason']}")
                 time.sleep(CYCLE_SECONDS)
                 continue
 
-            # 3) If we’re in local cooldown after a death/crash, do nothing but report
+            # Local cooldown
             if in_local_cooldown():
                 state["pet"]["survival_mode"] = "PAUSED"
                 state["pet"]["time_utc"] = utc_now_iso()
                 send_ingest_payloads(trade=None, status="cooldown")
-                log.info("🥚 In recovery cooldown (egg). No trading this cycle.")
+                log.info("🥚 In recovery cooldown (egg). No trading.")
                 time.sleep(CYCLE_SECONDS)
                 continue
             else:
-                # if cooldown ended and we were egg, revive
                 if state["pet"].get("stage") == "egg" and state["pet"].get("fainted_until_utc"):
                     revive_pet_ready()
+                    # clear API pause just in case
+                    api_post("/control/revive", {"reason": "cooldown finished"})
 
-            # 4) Trade (safe sim)
+            # Trade
             trade = simulate_trade()
             apply_trade_result(trade)
             update_pet_after_trade(trade["pnl_usd"])
 
-            # 5) If pet “dies”, trigger cooldown + death logging (instead of halting forever)
+            # If pet “dies”, cooldown instead of permanent halt
             if not state["pet"]["alive"]:
                 start_cooldown("pet_health_zero", {
                     "equity": state["equity"],
@@ -390,7 +390,6 @@ def run():
                 time.sleep(CYCLE_SECONDS)
                 continue
 
-            # 6) Normal ingest
             send_ingest_payloads(trade=trade, status="running")
 
             log.info(
@@ -412,11 +411,10 @@ def run():
             log.error(f"💥 Crash in main loop: {e}")
             ingest_event("💥 Crash in main loop", "error", {
                 "error": str(e),
-                "traceback": tb[:4000],  # keep it bounded
+                "traceback": tb[:4000],
                 "consecutive_errors": state["consecutive_errors"],
             })
 
-            # Put into cooldown so it “reverts to egg” and pauses to “learn”
             if state["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS_BEFORE_COOLDOWN:
                 start_cooldown("exception_crash", {
                     "error": str(e),
@@ -424,7 +422,6 @@ def run():
                     "consecutive_errors": state["consecutive_errors"],
                 })
 
-            # still report status while cooling down
             send_ingest_payloads(trade=None, status="error")
             time.sleep(CYCLE_SECONDS)
 
