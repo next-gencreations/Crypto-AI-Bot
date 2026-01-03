@@ -1,8 +1,8 @@
+
 import os
 import time
 import random
 import logging
-import traceback
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -10,30 +10,25 @@ from datetime import datetime, timezone, timedelta
 # CONFIG
 # =========================
 
-API_URL = os.environ.get("API_URL", "https://crypto-ai-api-1-7cte.onrender.com")
-CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "30"))
+API_URL = (os.getenv("API_URL") or "https://crypto-ai-api-1-7cte.onrender.com").rstrip("/")
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "30"))
 
-START_EQUITY = float(os.environ.get("START_EQUITY", "1000"))
-RISK_PER_TRADE_DEFAULT = float(os.environ.get("RISK_PER_TRADE", "0.01"))
+START_EQUITY = float(os.getenv("START_EQUITY", "1000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% paper risk
 
-# Recovery / survival
-DEATH_COOLDOWN_SECONDS = int(os.environ.get("DEATH_COOLDOWN_SECONDS", "600"))  # 10 minutes
-MAX_CONSECUTIVE_ERRORS_BEFORE_COOLDOWN = int(os.environ.get("MAX_ERRORS", "1"))
+# cryo rules (tweak later)
+MAX_LOSS_STREAK = int(os.getenv("MAX_LOSS_STREAK", "4"))
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "3.5"))  # % from peak
+CRYO_SECONDS = int(os.getenv("CRYO_SECONDS", "600"))  # 10 min
+
+MARKETS = [m.strip() for m in (os.getenv("MARKETS", "BTCUSDT,ETHUSDT").split(",")) if m.strip()]
 
 # =========================
 # LOGGING
 # =========================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("Crypto-AI-Bot")
-
-session = requests.Session()
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 # =========================
 # STATE
@@ -41,34 +36,22 @@ def utc_now_iso() -> str:
 
 state = {
     "equity": START_EQUITY,
+    "peak_equity": START_EQUITY,
     "wins": 0,
     "losses": 0,
+    "loss_streak": 0,
     "total_trades": 0,
     "total_pnl_usd": 0.0,
-    "consecutive_errors": 0,
-
-    # control from API
-    "paused": False,
-    "pause_reason": "",
-    "paused_until_utc": "",
-
-    # adaptive risk (reduces after deaths)
-    "risk_per_trade": RISK_PER_TRADE_DEFAULT,
-    "death_count": 0,
-    "last_death_reason": "",
-    "last_death_utc": "",
-
     "pet": {
         "name": "TradePet",
-        "stage": "active",
+        "sex": os.getenv("PET_SEX", "boy"),  # boy/girl (cosmetic)
+        "stage": "egg",
         "health": 100.0,
-        "mood": "neutral",
-        "hunger": 0.0,
+        "mood": "focused",
+        "hunger": 40.0,
         "growth": 0.0,
-        "alive": True,
         "fainted_until_utc": "",
-        "survival_mode": "NORMAL",
-        "time_utc": utc_now_iso()
+        "time_utc": None,
     }
 }
 
@@ -76,358 +59,248 @@ state = {
 # API HELPERS
 # =========================
 
-def api_post(endpoint: str, payload: dict) -> bool:
-    url = f"{API_URL}{endpoint}"
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def _post(path, payload):
     try:
-        r = session.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            return True
-        log.warning(f"POST {endpoint} failed: {r.status_code} {r.text[:200]}")
-        return False
+        r = requests.post(f"{API_URL}{path}", json=payload, timeout=10)
+        return r.status_code == 200
     except Exception as e:
-        log.warning(f"POST {endpoint} error: {e}")
+        log.warning(f"POST {path} failed: {e}")
         return False
 
-def api_get(endpoint: str):
-    url = f"{API_URL}{endpoint}"
+def _get(path):
     try:
-        r = session.get(url, timeout=10)
+        r = requests.get(f"{API_URL}{path}", timeout=10)
         if r.status_code != 200:
-            log.warning(f"GET {endpoint} failed: {r.status_code} {r.text[:200]}")
             return None
         return r.json()
     except Exception as e:
-        log.warning(f"GET {endpoint} error: {e}")
+        log.warning(f"GET {path} failed: {e}")
         return None
 
-def ingest_event(msg: str, type_: str = "info", details: dict | None = None):
-    api_post("/ingest/event", {
-        "time_utc": utc_now_iso(),
-        "type": type_,
-        "message": msg,
-        "details": details or {}
-    })
+def api_control():
+    c = _get("/control") or {}
+    return {
+        "state": (c.get("state") or "ACTIVE").upper(),
+        "pause_until_utc": c.get("pause_until_utc", ""),
+        "cryo_until_utc": c.get("cryo_until_utc", ""),
+        "pause_reason": c.get("pause_reason", ""),
+        "cryo_reason": c.get("cryo_reason", ""),
+    }
 
-def ingest_death(reason: str, details: dict | None = None):
-    api_post("/ingest/death", {
-        "time_utc": utc_now_iso(),
+def enter_cryo(reason: str, details: dict):
+    # Tell API we entered cryo
+    _post("/control/cryo", {"seconds": CRYO_SECONDS, "reason": reason})
+
+    # Record a "death" log (really: cryo/death history)
+    _post("/ingest/death", {
+        "time_utc": utc_now(),
         "source": "bot",
-        "reason": reason,
-        "details": details or {}
+        "reason": "CRYO_TRIGGERED",
+        "details": {"why": reason, **(details or {})}
     })
-
-def fetch_control():
-    """
-    /control returns:
-    { "pause_until_utc": "...", "pause_reason": "...", ... }
-    We treat paused=true if now < pause_until_utc.
-    """
-    data = api_get("/control")
-    if not data:
-        state["paused"] = False
-        state["pause_reason"] = ""
-        state["paused_until_utc"] = ""
-        return
-
-    pause_until = (data.get("pause_until_utc") or "").strip()
-    pause_reason = (data.get("pause_reason") or "").strip()
-
-    paused = False
-    if pause_until:
-        try:
-            until_dt = datetime.fromisoformat(pause_until)
-            paused = datetime.now(timezone.utc) < until_dt
-        except Exception:
-            paused = False
-
-    state["paused"] = paused
-    state["pause_reason"] = pause_reason
-    state["paused_until_utc"] = pause_until
 
 # =========================
 # PET LOGIC
 # =========================
 
-def set_pet_egg_recovering(until_utc: str, reason: str):
-    pet = state["pet"]
-    pet["stage"] = "egg"
-    pet["mood"] = "recovering"
-    pet["alive"] = True
-    pet["survival_mode"] = "PAUSED"
-    pet["fainted_until_utc"] = until_utc
-    pet["time_utc"] = utc_now_iso()
+def pet_tick():
+    p = state["pet"]
+    now = utc_now()
+    p["time_utc"] = now
 
-    ingest_event("🥚 Pet", "warn", {
-        "action": "revert_to_egg",
-        "until_utc": until_utc,
-        "reason": reason
-    })
+    # hunger rises
+    p["hunger"] = min(100.0, p["hunger"] + 2.0)
 
-def revive_pet_ready():
-    pet = state["pet"]
-    pet["stage"] = "active"
-    pet["mood"] = "neutral"
-    pet["health"] = 100.0
-    pet["hunger"] = 0.0
-    pet["growth"] = 0.0
-    pet["alive"] = True
-    pet["survival_mode"] = "NORMAL"
-    pet["fainted_until_utc"] = ""
-    pet["time_utc"] = utc_now_iso()
+    # health reacts to hunger
+    if p["hunger"] > 85:
+        p["health"] = max(0.0, p["health"] - 2.0)
+    elif p["hunger"] < 35:
+        p["health"] = min(100.0, p["health"] + 0.6)
 
-    ingest_event("✅ Recovery complete. Pet active.", "info", {})
-
-def update_pet_after_trade(pnl: float):
-    pet = state["pet"]
-
-    pet["hunger"] = float(pet.get("hunger", 0.0)) + 5.0
-
-    if pnl > 0:
-        pet["health"] = min(100.0, float(pet["health"]) + 5.0)
-        pet["mood"] = "happy"
-        pet["hunger"] = max(0.0, float(pet["hunger"]) - 10.0)
-        pet["growth"] = float(pet.get("growth", 0.0)) + 1.0
+    # mood
+    if p["health"] < 20:
+        p["mood"] = "sick"
+    elif p["hunger"] > 85:
+        p["mood"] = "hungry"
     else:
-        pet["health"] = float(pet["health"]) - 5.0
-        pet["mood"] = "sad"
-        pet["growth"] = max(0.0, float(pet.get("growth", 0.0)) - 0.5)
+        p["mood"] = "focused"
 
-    if float(pet["hunger"]) > 80.0:
-        pet["health"] = float(pet["health"]) - 5.0
-        pet["mood"] = "hungry"
+    # hatch rule
+    if p["stage"] == "egg" and (state["total_pnl_usd"] > 0 or state["wins"] >= 5):
+        p["stage"] = "hatched"
+        p["growth"] = max(p["growth"], 10.0)
 
-    pet["alive"] = float(pet["health"]) > 0.0
-    pet["survival_mode"] = "NORMAL"
-    pet["time_utc"] = utc_now_iso()
+def pet_on_trade(pnl):
+    p = state["pet"]
+    if pnl > 0:
+        p["hunger"] = max(0.0, p["hunger"] - 12.0)
+        p["health"] = min(100.0, p["health"] + 2.5)
+        p["growth"] = min(100.0, p["growth"] + 2.0)
+        p["mood"] = "happy"
+        # “sound”
+        _post("/ingest/event", {"time_utc": utc_now(), "type": "sound", "message": "purr", "details": {"pnl": pnl}})
+    else:
+        p["hunger"] = min(100.0, p["hunger"] + 8.0)
+        p["health"] = max(0.0, p["health"] - 4.0)
+        p["mood"] = "sad"
+        _post("/ingest/event", {"time_utc": utc_now(), "type": "sound", "message": "whimper", "details": {"pnl": pnl}})
 
 # =========================
-# TRADING LOGIC (SAFE SIM)
+# TRADING LOGIC (SAFE PAPER SIM)
 # =========================
 
 def simulate_trade():
-    risk = max(1.0, state["equity"] * state["risk_per_trade"])
-    market = "BTCUSDT"
-    side = "buy" if random.random() > 0.5 else "sell"
-    confidence = round(random.uniform(0.35, 0.95), 2)
+    risk_usd = state["equity"] * RISK_PER_TRADE
 
-    win = random.random() > 0.45
-    pnl = (risk * random.uniform(0.8, 1.5)) if win else (-risk)
+    # slightly “edgey” win chance (you'll replace later with real logic)
+    win = random.random() > 0.47
 
-    price = random.uniform(30000, 60000)
-    size_usd = risk
+    pnl = risk_usd * random.uniform(0.6, 1.6) if win else -risk_usd
 
-    reason = "simulated"
-    if confidence < 0.45:
-        reason = "low_confidence_sim"
-    elif confidence > 0.8:
-        reason = "high_confidence_sim"
-
-    return {
-        "market": market,
-        "side": side,
-        "confidence": confidence,
-        "price": price,
-        "size_usd": size_usd,
-        "pnl_usd": pnl,
-        "reason": reason,
-        "time_utc": utc_now_iso(),
-    }
-
-def apply_trade_result(trade: dict):
-    pnl = float(trade["pnl_usd"])
     state["equity"] += pnl
-    state["total_trades"] += 1
+    state["peak_equity"] = max(state["peak_equity"], state["equity"])
     state["total_pnl_usd"] += pnl
+    state["total_trades"] += 1
 
     if pnl > 0:
         state["wins"] += 1
+        state["loss_streak"] = 0
     else:
         state["losses"] += 1
+        state["loss_streak"] += 1
+
+    return pnl
+
+def survival_mode():
+    p = state["pet"]
+    if p["hunger"] > 90:
+        return "STARVING"
+    if p["hunger"] > 75:
+        return "HUNGRY"
+    if p["health"] < 25:
+        return "SICK"
+    return "NORMAL"
+
+def drawdown_pct():
+    peak = max(1e-9, state["peak_equity"])
+    dd = (peak - state["equity"]) / peak * 100.0
+    return dd
 
 # =========================
-# COOLDOWN
+# PRICE TICKS (FOR OHLC)
 # =========================
 
-def in_local_cooldown() -> bool:
-    until = state["pet"].get("fainted_until_utc") or ""
-    if not until:
-        return False
-    try:
-        until_dt = datetime.fromisoformat(until)
-        return datetime.now(timezone.utc) < until_dt
-    except Exception:
-        return False
+_last_prices = {"BTCUSDT": 42000.0, "ETHUSDT": 2200.0}
 
-def start_cooldown(reason: str, extra: dict | None = None):
-    state["death_count"] += 1
-    state["last_death_reason"] = reason
-    state["last_death_utc"] = utc_now_iso()
-
-    # reduce risk after each death
-    state["risk_per_trade"] = max(0.002, state["risk_per_trade"] * 0.8)
-
-    until_dt = datetime.now(timezone.utc) + timedelta(seconds=DEATH_COOLDOWN_SECONDS)
-    until_utc = until_dt.replace(microsecond=0).isoformat()
-
-    ingest_event("💀 Failure detected. 10-min recovery pause.", "error", {
-        "reason": reason,
-        "cooldown_seconds": DEATH_COOLDOWN_SECONDS,
-        "new_risk_per_trade": state["risk_per_trade"],
-        "extra": extra or {}
-    })
-    ingest_death(reason, {
-        "cooldown_seconds": DEATH_COOLDOWN_SECONDS,
-        "new_risk_per_trade": state["risk_per_trade"],
-        **(extra or {})
-    })
-
-    # optionally also set API pause so dashboard shows it
-    api_post("/control/pause", {
-        "seconds": DEATH_COOLDOWN_SECONDS,
-        "reason": reason
-    })
-
-    set_pet_egg_recovering(until_utc, reason)
-
-# =========================
-# INGEST (one place)
-# =========================
-
-def send_ingest_payloads(trade: dict | None, status: str):
-    api_post("/ingest/heartbeat", {
-        "time_utc": utc_now_iso(),
-        "status": status,
-        "survival_mode": state["pet"].get("survival_mode", "NORMAL"),
-        "equity_usd": state["equity"],
-        "open_positions": 0,
-        "prices_ok": True,
-        "markets": ["BTCUSDT"],
-        "losses": state["losses"],
-        "total_trades": state["total_trades"],
-        "wins": state["wins"],
-        "total_pnl_usd": state["total_pnl_usd"],
-    })
-
-    api_post("/ingest/pet", state["pet"])
-
-    api_post("/ingest/equity", {
-        "time_utc": utc_now_iso(),
-        "equity_usd": state["equity"]
-    })
-
-    if trade is not None:
-        api_post("/ingest/trade", {
-            "time_utc": trade["time_utc"],
-            "market": trade["market"],
-            "side": trade["side"],
-            "size_usd": trade["size_usd"],
-            "price": trade["price"],
-            "pnl_usd": trade["pnl_usd"],
-            "reason": trade["reason"],
-            "confidence": trade["confidence"],
-        })
-
-    api_post("/ingest/prices", {
-        "time_utc": utc_now_iso(),
-        "prices": {"BTCUSDT": random.uniform(30000, 60000)}
-    })
+def generate_fake_prices():
+    # simple random walk so candles look real-ish
+    for m in MARKETS:
+        base = _last_prices.get(m, 1000.0)
+        step = base * random.uniform(-0.0018, 0.0018)
+        base = max(0.1, base + step)
+        _last_prices[m] = base
+    return dict(_last_prices)
 
 # =========================
 # MAIN LOOP
 # =========================
 
 def run():
-    log.info("🚀 Crypto-AI-Bot started")
-    ingest_event("🚀 Crypto-AI-Bot started", "info", {
-        "cycle_seconds": CYCLE_SECONDS,
-        "start_equity": START_EQUITY
-    })
+    log.info(f"🚀 Bot started. API_URL={API_URL} cycle={CYCLE_SECONDS}s markets={MARKETS}")
 
     while True:
-        try:
-            # Remote pause control
-            fetch_control()
+        # 1) tick pet always
+        pet_tick()
 
-            if state["paused"]:
-                state["pet"]["stage"] = "egg"
-                state["pet"]["mood"] = "paused"
-                state["pet"]["survival_mode"] = "PAUSED"
-                state["pet"]["time_utc"] = utc_now_iso()
+        # 2) read API control state
+        ctrl = api_control()
+        mode = ctrl["state"]
 
-                send_ingest_payloads(trade=None, status="paused")
-                log.info(f"⏸️ PAUSED by API. Reason: {state['pause_reason']}")
-                time.sleep(CYCLE_SECONDS)
-                continue
+        # 3) always push prices (so candles keep forming even during cryo)
+        prices = generate_fake_prices()
+        _post("/ingest/prices", {"time_utc": utc_now(), "prices": prices})
 
-            # Local cooldown
-            if in_local_cooldown():
-                state["pet"]["survival_mode"] = "PAUSED"
-                state["pet"]["time_utc"] = utc_now_iso()
-                send_ingest_payloads(trade=None, status="cooldown")
-                log.info("🥚 In recovery cooldown (egg). No trading.")
-                time.sleep(CYCLE_SECONDS)
-                continue
-            else:
-                if state["pet"].get("stage") == "egg" and state["pet"].get("fainted_until_utc"):
-                    revive_pet_ready()
-                    # clear API pause just in case
-                    api_post("/control/revive", {"reason": "cooldown finished"})
+        # 4) If CRYO or PAUSED, do NOT trade — just heartbeat/pet
+        if mode in ("CRYO", "PAUSED"):
+            # In cryo, pet recovers slowly
+            if mode == "CRYO":
+                state["pet"]["mood"] = "cryo"
+                state["pet"]["health"] = min(100.0, state["pet"]["health"] + 0.8)
+                state["pet"]["hunger"] = min(100.0, state["pet"]["hunger"] + 0.5)
 
-            # Trade
-            trade = simulate_trade()
-            apply_trade_result(trade)
-            update_pet_after_trade(trade["pnl_usd"])
-
-            # If pet “dies”, cooldown instead of permanent halt
-            if not state["pet"]["alive"]:
-                start_cooldown("pet_health_zero", {
-                    "equity": state["equity"],
-                    "total_trades": state["total_trades"],
-                    "wins": state["wins"],
-                    "losses": state["losses"]
-                })
-                send_ingest_payloads(trade=None, status="cooldown")
-                time.sleep(CYCLE_SECONDS)
-                continue
-
-            send_ingest_payloads(trade=trade, status="running")
-
-            log.info(
-                f"Trade #{state['total_trades']} | "
-                f"{trade['market']} {trade['side']} | "
-                f"PnL: {trade['pnl_usd']:.2f} | "
-                f"Equity: {state['equity']:.2f} | "
-                f"HP: {state['pet']['health']:.1f} | "
-                f"Risk: {state['risk_per_trade']:.4f}"
-            )
-
-            state["consecutive_errors"] = 0
-            time.sleep(CYCLE_SECONDS)
-
-        except Exception as e:
-            state["consecutive_errors"] += 1
-            tb = traceback.format_exc()
-
-            log.error(f"💥 Crash in main loop: {e}")
-            ingest_event("💥 Crash in main loop", "error", {
-                "error": str(e),
-                "traceback": tb[:4000],
-                "consecutive_errors": state["consecutive_errors"],
+            # heartbeat + pet + equity point
+            _post("/ingest/heartbeat", {
+                "time_utc": utc_now(),
+                "status": "running",
+                "survival_mode": survival_mode(),
+                "equity_usd": state["equity"],
+                "wins": state["wins"],
+                "losses": state["losses"],
+                "total_trades": state["total_trades"],
+                "total_pnl_usd": state["total_pnl_usd"],
+                "markets": MARKETS,
+                "open_positions": 0,
+                "prices_ok": True,
             })
+            _post("/ingest/pet", {**state["pet"], "time_utc": utc_now(), "survival_mode": survival_mode()})
+            _post("/ingest/equity", {"time_utc": utc_now(), "equity_usd": state["equity"]})
 
-            if state["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS_BEFORE_COOLDOWN:
-                start_cooldown("exception_crash", {
-                    "error": str(e),
-                    "traceback": tb[:4000],
-                    "consecutive_errors": state["consecutive_errors"],
-                })
-
-            send_ingest_payloads(trade=None, status="error")
+            log.info(f"🧊 {mode} active ({ctrl.get('cryo_reason') or ctrl.get('pause_reason')}). No trading.")
             time.sleep(CYCLE_SECONDS)
+            continue
 
-# =========================
-# ENTRY
-# =========================
+        # 5) Trade cycle (paper sim)
+        pnl = simulate_trade()
+        pet_on_trade(pnl)
+
+        dd = drawdown_pct()
+
+        log.info(
+            f"Trade #{state['total_trades']} | PnL {pnl:.2f} | Equity {state['equity']:.2f} | "
+            f"DD {dd:.2f}% | LossStreak {state['loss_streak']} | PetHP {state['pet']['health']:.1f}"
+        )
+
+        # 6) Cryo trigger rules (THIS is the “cryo tube” safety net)
+        if state["loss_streak"] >= MAX_LOSS_STREAK:
+            enter_cryo("loss_streak", {"loss_streak": state["loss_streak"], "drawdown_pct": dd, "equity": state["equity"]})
+
+        if dd >= MAX_DRAWDOWN_PCT:
+            enter_cryo("max_drawdown", {"drawdown_pct": dd, "peak": state["peak_equity"], "equity": state["equity"]})
+
+        # 7) push state to API
+        _post("/ingest/heartbeat", {
+            "time_utc": utc_now(),
+            "status": "running",
+            "survival_mode": survival_mode(),
+            "equity_usd": state["equity"],
+            "wins": state["wins"],
+            "losses": state["losses"],
+            "total_trades": state["total_trades"],
+            "total_pnl_usd": state["total_pnl_usd"],
+            "markets": MARKETS,
+            "open_positions": 0,
+            "prices_ok": True,
+        })
+
+        _post("/ingest/pet", {**state["pet"], "time_utc": utc_now(), "survival_mode": survival_mode()})
+        _post("/ingest/equity", {"time_utc": utc_now(), "equity_usd": state["equity"]})
+
+        # trade log
+        _post("/ingest/trade", {
+            "time_utc": utc_now(),
+            "market": "BTCUSDT",
+            "side": "buy" if pnl >= 0 else "sell",
+            "size_usd": state["equity"] * RISK_PER_TRADE,
+            "price": prices.get("BTCUSDT", 0),
+            "pnl_usd": pnl,
+            "confidence": 0.60,
+            "reason": "paper_sim",
+        })
+
+        time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
     run()
