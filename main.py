@@ -1,48 +1,57 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import random
 import logging
 import requests
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
 # =========================
 # CONFIG
 # =========================
 
 API_URL = (os.getenv("API_URL") or "https://crypto-ai-api-1-7cte.onrender.com").rstrip("/")
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "30"))
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "60"))
 
 START_EQUITY = float(os.getenv("START_EQUITY", "1000"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% paper risk
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))  # confident but sane
 
-# cryo rules
-MAX_LOSS_STREAK = int(os.getenv("MAX_LOSS_STREAK", "4"))
-MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "3.5"))  # % from peak
-CRYO_SECONDS = int(os.getenv("CRYO_SECONDS", "600"))  # 10 min
+# Cryo rules
+MAX_LOSS_STREAK = int(os.getenv("MAX_LOSS_STREAK", "5"))
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "5.0"))  # % from peak
+CRYO_SECONDS = int(os.getenv("CRYO_SECONDS", "420"))  # 7 min
 
+# IMPORTANT: keep these in USDT format to match your API/dashboard
 MARKETS = [m.strip() for m in (os.getenv("MARKETS", "BTCUSDT,ETHUSDT").split(",")) if m.strip()]
 
 # =========================
-# CONFIDENCE -> BEHAVIOUR (NEW)
+# CONFIDENCE -> BEHAVIOUR
 # =========================
-# Trade gating
-CONF_MIN_TRADE = float(os.getenv("CONF_MIN_TRADE", "0.58"))
 
-# Scaling band for size
-CONF_LOW = float(os.getenv("CONF_LOW", "0.60"))
-CONF_HIGH = float(os.getenv("CONF_HIGH", "0.80"))
-SIZE_MIN_MULT = float(os.getenv("SIZE_MIN_MULT", "0.50"))  # 50% size at low confidence
-SIZE_MAX_MULT = float(os.getenv("SIZE_MAX_MULT", "1.50"))  # 150% size at high confidence
+# Gate: skip trades below this confidence (lower = trades more often)
+CONF_MIN_TRADE = float(os.getenv("CONF_MIN_TRADE", "0.52"))
 
-# Strictness band (lower confidence => freeze sooner)
+# Confidence band used for scaling size and pet effects
+CONF_LOW = float(os.getenv("CONF_LOW", "0.58"))
+CONF_HIGH = float(os.getenv("CONF_HIGH", "0.78"))
+
+# Size multiplier at low/high confidence
+SIZE_MIN_MULT = float(os.getenv("SIZE_MIN_MULT", "0.80"))
+SIZE_MAX_MULT = float(os.getenv("SIZE_MAX_MULT", "1.80"))
+
+# Stricter freezing when confidence is low
 STRICT_STREAK_LOWCONF = int(os.getenv("STRICT_STREAK_LOWCONF", "2"))
 STRICT_STREAK_MIDCONF = int(os.getenv("STRICT_STREAK_MIDCONF", "3"))
-STRICT_STREAK_LOW_CUTOFF = float(os.getenv("STRICT_STREAK_LOW_CUTOFF", "0.58"))
-STRICT_STREAK_MID_CUTOFF = float(os.getenv("STRICT_STREAK_MID_CUTOFF", "0.65"))
+STRICT_STREAK_LOW_CUTOFF = float(os.getenv("STRICT_STREAK_LOW_CUTOFF", "0.52"))
+STRICT_STREAK_MID_CUTOFF = float(os.getenv("STRICT_STREAK_MID_CUTOFF", "0.60"))
 
-# Optional: confidence generation range (until real model plugged in)
-CONF_GEN_MIN = float(os.getenv("CONF_GEN_MIN", "0.50"))
+# TEMP confidence generator until real model plugged in
+CONF_GEN_MIN = float(os.getenv("CONF_GEN_MIN", "0.55"))
 CONF_GEN_MAX = float(os.getenv("CONF_GEN_MAX", "0.90"))
+
+# Paper-sim "edge" (higher = wins more often). 0.42 => ~58% win rate.
+WIN_THRESHOLD = float(os.getenv("WIN_THRESHOLD", "0.42"))
 
 # =========================
 # LOGGING
@@ -55,7 +64,7 @@ log = logging.getLogger("Crypto-AI-Bot")
 # STATE
 # =========================
 
-state = {
+state: Dict[str, Any] = {
     "equity": START_EQUITY,
     "peak_equity": START_EQUITY,
     "wins": 0,
@@ -65,7 +74,7 @@ state = {
     "total_pnl_usd": 0.0,
     "pet": {
         "name": "TradePet",
-        "sex": os.getenv("PET_SEX", "boy"),  # boy/girl (cosmetic)
+        "sex": os.getenv("PET_SEX", "boy"),
         "stage": "egg",
         "health": 100.0,
         "mood": "focused",
@@ -80,42 +89,39 @@ state = {
 # API HELPERS
 # =========================
 
-def utc_now():
+def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-def _post(path, payload):
+def _post(path: str, payload: Dict[str, Any]) -> bool:
     try:
         r = requests.post(f"{API_URL}{path}", json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
-        log.warning(f"POST {path} failed: {e}")
+        log.warning("POST %s failed: %s", path, e)
         return False
 
-def _get(path):
+def _get(path: str) -> Optional[Dict[str, Any]]:
     try:
         r = requests.get(f"{API_URL}{path}", timeout=10)
         if r.status_code != 200:
             return None
         return r.json()
     except Exception as e:
-        log.warning(f"GET {path} failed: {e}")
+        log.warning("GET %s failed: %s", path, e)
         return None
 
-def api_control():
+def api_control() -> Dict[str, str]:
     c = _get("/control") or {}
     return {
         "state": (c.get("state") or "ACTIVE").upper(),
-        "pause_until_utc": c.get("pause_until_utc", ""),
-        "cryo_until_utc": c.get("cryo_until_utc", ""),
-        "pause_reason": c.get("pause_reason", ""),
-        "cryo_reason": c.get("cryo_reason", ""),
+        "pause_until_utc": c.get("pause_until_utc", "") or "",
+        "cryo_until_utc": c.get("cryo_until_utc", "") or "",
+        "pause_reason": c.get("pause_reason", "") or "",
+        "cryo_reason": c.get("cryo_reason", "") or "",
     }
 
-def enter_cryo(reason: str, details: dict):
-    # Tell API we entered cryo
+def enter_cryo(reason: str, details: Dict[str, Any]) -> None:
     _post("/control/cryo", {"seconds": CRYO_SECONDS, "reason": reason})
-
-    # Record a "death" log (really: cryo/death history)
     _post("/ingest/death", {
         "time_utc": utc_now(),
         "source": "bot",
@@ -123,7 +129,7 @@ def enter_cryo(reason: str, details: dict):
         "details": {"why": reason, **(details or {})}
     })
 
-def log_event(ev_type: str, message: str, details: dict | None = None):
+def log_event(ev_type: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
     _post("/ingest/event", {
         "time_utc": utc_now(),
         "type": ev_type,
@@ -132,10 +138,10 @@ def log_event(ev_type: str, message: str, details: dict | None = None):
     })
 
 # =========================
-# CONFIDENCE HELPERS (NEW)
+# CONFIDENCE HELPERS
 # =========================
 
-def clamp(x, lo, hi):
+def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def confidence_to_size_mult(conf: float) -> float:
@@ -146,7 +152,6 @@ def confidence_to_size_mult(conf: float) -> float:
     return SIZE_MIN_MULT + t * (SIZE_MAX_MULT - SIZE_MIN_MULT)
 
 def confidence_to_strict_loss_streak(conf: float) -> int:
-    # lower confidence -> stricter (freeze sooner)
     if conf < STRICT_STREAK_LOW_CUTOFF:
         return STRICT_STREAK_LOWCONF
     if conf < STRICT_STREAK_MID_CUTOFF:
@@ -154,27 +159,23 @@ def confidence_to_strict_loss_streak(conf: float) -> int:
     return MAX_LOSS_STREAK
 
 def generate_confidence() -> float:
-    # TEMP until real AI signal is plugged in
     return float(random.uniform(CONF_GEN_MIN, CONF_GEN_MAX))
 
 # =========================
 # PET LOGIC
 # =========================
 
-def pet_tick():
+def pet_tick() -> None:
     p = state["pet"]
     p["time_utc"] = utc_now()
 
-    # hunger rises
     p["hunger"] = min(100.0, p["hunger"] + 2.0)
 
-    # health reacts to hunger
     if p["hunger"] > 85:
         p["health"] = max(0.0, p["health"] - 2.0)
     elif p["hunger"] < 35:
         p["health"] = min(100.0, p["health"] + 0.6)
 
-    # mood
     if p["health"] < 20:
         p["mood"] = "sick"
     elif p["hunger"] > 85:
@@ -182,26 +183,18 @@ def pet_tick():
     else:
         p["mood"] = "focused"
 
-    # hatch rule
     if p["stage"] == "egg" and (state["total_pnl_usd"] > 0 or state["wins"] >= 5):
         p["stage"] = "hatched"
         p["growth"] = max(p["growth"], 10.0)
 
-def pet_on_trade(pnl: float, confidence: float):
-    """
-    Confidence affects pet reward/penalty:
-      - high confidence wins = bigger growth
-      - low confidence losses = bigger health hit
-    """
+def pet_on_trade(pnl: float, confidence: float) -> None:
     p = state["pet"]
 
-    # normalize conf into 0..1 across the band
     conf01 = 0.0
     if CONF_HIGH != CONF_LOW:
         conf01 = (clamp(confidence, CONF_LOW, CONF_HIGH) - CONF_LOW) / (CONF_HIGH - CONF_LOW)
 
     if pnl > 0:
-        # reward scales with confidence
         hunger_drop = 10.0 + (6.0 * conf01)
         hp_gain = 1.5 + (2.0 * conf01)
         growth_gain = 1.0 + (2.5 * conf01)
@@ -212,8 +205,7 @@ def pet_on_trade(pnl: float, confidence: float):
         p["mood"] = "happy"
         log_event("sound", "purr", {"pnl": pnl, "confidence": confidence})
     else:
-        # penalty increases when confidence is low
-        low_conf_penalty = 1.0 - conf01  # 1 when low, 0 when high
+        low_conf_penalty = 1.0 - conf01
         hunger_up = 6.0 + (6.0 * low_conf_penalty)
         hp_drop = 3.0 + (3.0 * low_conf_penalty)
 
@@ -226,15 +218,11 @@ def pet_on_trade(pnl: float, confidence: float):
 # TRADING LOGIC (SAFE PAPER SIM)
 # =========================
 
-def simulate_trade(risk_usd: float):
-    """
-    Paper sim uses a risk amount per trade (USD).
-    risk_usd is already confidence-scaled.
-    """
+def simulate_trade(risk_usd: float) -> float:
     risk_usd = max(0.0, float(risk_usd))
 
-    # slightly “edgey” win chance (replace later with real logic)
-    win = random.random() > 0.47
+    # "Winning-style" paper sim edge
+    win = random.random() > WIN_THRESHOLD
 
     pnl = risk_usd * random.uniform(0.6, 1.6) if win else -risk_usd
 
@@ -252,7 +240,7 @@ def simulate_trade(risk_usd: float):
 
     return pnl
 
-def survival_mode():
+def survival_mode() -> str:
     p = state["pet"]
     if p["hunger"] > 90:
         return "STARVING"
@@ -262,7 +250,7 @@ def survival_mode():
         return "SICK"
     return "NORMAL"
 
-def drawdown_pct():
+def drawdown_pct() -> float:
     peak = max(1e-9, state["peak_equity"])
     return (peak - state["equity"]) / peak * 100.0
 
@@ -270,10 +258,9 @@ def drawdown_pct():
 # PRICE TICKS (FOR OHLC)
 # =========================
 
-_last_prices = {"BTCUSDT": 42000.0, "ETHUSDT": 2200.0}
+_last_prices: Dict[str, float] = {"BTCUSDT": 42000.0, "ETHUSDT": 2200.0}
 
-def generate_fake_prices():
-    # simple random walk so candles look real-ish
+def generate_fake_prices() -> Dict[str, float]:
     for m in MARKETS:
         base = _last_prices.get(m, 1000.0)
         step = base * random.uniform(-0.0018, 0.0018)
@@ -282,10 +269,10 @@ def generate_fake_prices():
     return dict(_last_prices)
 
 # =========================
-# MAIN LOOP
+# PUSH HELPERS
 # =========================
 
-def push_heartbeat(prices_ok=True):
+def push_heartbeat(prices_ok: bool = True) -> None:
     _post("/ingest/heartbeat", {
         "time_utc": utc_now(),
         "status": "running",
@@ -300,26 +287,27 @@ def push_heartbeat(prices_ok=True):
         "prices_ok": bool(prices_ok),
     })
 
-def push_pet_and_equity():
+def push_pet_and_equity() -> None:
     _post("/ingest/pet", {**state["pet"], "time_utc": utc_now(), "survival_mode": survival_mode()})
     _post("/ingest/equity", {"time_utc": utc_now(), "equity_usd": state["equity"]})
 
-def run():
-    log.info(f"🚀 Bot started. API_URL={API_URL} cycle={CYCLE_SECONDS}s markets={MARKETS}")
+# =========================
+# MAIN LOOP
+# =========================
+
+def run() -> None:
+    log.info("Bot started. API_URL=%s cycle=%ss markets=%s", API_URL, CYCLE_SECONDS, MARKETS)
 
     while True:
-        # 1) tick pet always
         pet_tick()
 
-        # 2) read API control state
         ctrl = api_control()
         mode = ctrl["state"]
 
-        # 3) always push prices (so candles keep forming even during cryo)
         prices = generate_fake_prices()
         _post("/ingest/prices", {"time_utc": utc_now(), "prices": prices})
 
-        # 4) If CRYO or PAUSED, do NOT trade — just heartbeat/pet
+        # No trading during CRYO/PAUSED
         if mode in ("CRYO", "PAUSED"):
             if mode == "CRYO":
                 state["pet"]["mood"] = "cryo"
@@ -329,33 +317,26 @@ def run():
             push_heartbeat(prices_ok=True)
             push_pet_and_equity()
 
-            log.info(f"🧊 {mode} active ({ctrl.get('cryo_reason') or ctrl.get('pause_reason')}). No trading.")
+            log.info("%s active (%s). No trading.", mode, ctrl.get("cryo_reason") or ctrl.get("pause_reason"))
             time.sleep(CYCLE_SECONDS)
             continue
 
-        # =========================
-        # 5) CONFIDENCE DECISION (NEW)
-        # =========================
+        # Confidence decision
         confidence = generate_confidence()
 
-        # Gate: skip trade if too low confidence
         if confidence < CONF_MIN_TRADE:
             log_event("decision", "skip_trade_low_confidence", {"confidence": confidence, "min": CONF_MIN_TRADE})
-
-            # still push heartbeat/pet/equity so dashboard updates
             push_heartbeat(prices_ok=True)
             push_pet_and_equity()
-
-            log.info(f"⛔ Skip trade | confidence={confidence:.3f} < {CONF_MIN_TRADE:.3f}")
+            log.info("Skip trade | confidence=%.3f < %.3f", confidence, CONF_MIN_TRADE)
             time.sleep(CYCLE_SECONDS)
             continue
 
-        # Scale risk/size by confidence
+        # Size/risk scaling
         size_mult = confidence_to_size_mult(confidence)
         base_risk_usd = state["equity"] * RISK_PER_TRADE
         risk_usd = base_risk_usd * size_mult
 
-        # Stricter loss streak threshold when confidence is low
         strict_loss_streak = confidence_to_strict_loss_streak(confidence)
 
         log_event("decision", "trade_decision", {
@@ -365,19 +346,18 @@ def run():
             "strict_loss_streak": strict_loss_streak
         })
 
-        # 6) Trade (paper sim) using confidence-scaled risk
         pnl = simulate_trade(risk_usd=risk_usd)
         pet_on_trade(pnl, confidence)
 
         dd = drawdown_pct()
 
         log.info(
-            f"Trade #{state['total_trades']} | PnL {pnl:.2f} | Equity {state['equity']:.2f} | "
-            f"DD {dd:.2f}% | LossStreak {state['loss_streak']} (thr {strict_loss_streak}) | "
-            f"Conf {confidence:.2f} | SizeMult {size_mult:.2f} | PetHP {state['pet']['health']:.1f}"
+            "Trade #%d | PnL %.2f | Equity %.2f | DD %.2f%% | LossStreak %d (thr %d) | Conf %.2f | SizeMult %.2f | PetHP %.1f",
+            state["total_trades"], pnl, state["equity"], dd, state["loss_streak"], strict_loss_streak,
+            confidence, size_mult, state["pet"]["health"]
         )
 
-        # 7) Cryo triggers (updated with confidence strictness)
+        # Cryo triggers
         if state["loss_streak"] >= strict_loss_streak:
             enter_cryo("loss_streak", {
                 "loss_streak": state["loss_streak"],
@@ -395,18 +375,16 @@ def run():
                 "confidence": confidence
             })
 
-        # 8) push state to API
         push_heartbeat(prices_ok=True)
         push_pet_and_equity()
 
-        # trade log (confidence + scaled size)
         _post("/ingest/trade", {
             "time_utc": utc_now(),
             "market": "BTCUSDT",
             "side": "buy" if pnl >= 0 else "sell",
-            "size_usd": risk_usd,  # confidence-scaled size
-            "price": prices.get("BTCUSDT", 0),
-            "pnl_usd": pnl,
+            "size_usd": float(risk_usd),
+            "price": float(prices.get("BTCUSDT", 0)),
+            "pnl_usd": float(pnl),
             "confidence": float(confidence),
             "reason": "paper_sim_confidence_scaled",
         })
@@ -415,4 +393,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-```0
