@@ -46,12 +46,15 @@ STRICT_STREAK_MIDCONF = int(os.getenv("STRICT_STREAK_MIDCONF", "3"))
 STRICT_STREAK_LOW_CUTOFF = float(os.getenv("STRICT_STREAK_LOW_CUTOFF", "0.52"))
 STRICT_STREAK_MID_CUTOFF = float(os.getenv("STRICT_STREAK_MID_CUTOFF", "0.60"))
 
-# TEMP confidence generator until real model plugged in
+# TEMP confidence generator until real model plugged in (used if /signal fails)
 CONF_GEN_MIN = float(os.getenv("CONF_GEN_MIN", "0.55"))
 CONF_GEN_MAX = float(os.getenv("CONF_GEN_MAX", "0.90"))
 
 # Paper-sim "edge" (higher = wins more often). 0.42 => ~58% win rate.
 WIN_THRESHOLD = float(os.getenv("WIN_THRESHOLD", "0.42"))
+
+# Use /signal endpoint (turn off if needed)
+USE_SIGNAL = (os.getenv("USE_SIGNAL", "1").strip().lower() not in ("0", "false", "no"))
 
 # =========================
 # LOGGING
@@ -138,6 +141,38 @@ def log_event(ev_type: str, message: str, details: Optional[Dict[str, Any]] = No
     })
 
 # =========================
+# SIGNAL HELPER (NEW)
+# =========================
+
+def get_signal(market: str = "BTCUSDT") -> Dict[str, Any]:
+    """
+    Calls the API brain: GET /signal?market=BTCUSDT
+    Expected response shape:
+      { side: "buy|sell|hold", confidence: 0..1, reason: "...", features: {...} }
+    Safe defaults if missing.
+    """
+    # IMPORTANT: _get expects a path starting with /
+    s = _get(f"/signal?market={market}") or {}
+    side = (s.get("side") or "hold").lower().strip()
+    if side not in ("buy", "sell", "hold"):
+        side = "hold"
+
+    try:
+        conf = float(s.get("confidence") or 0.5)
+    except Exception:
+        conf = 0.5
+
+    reason = s.get("reason") or "unknown"
+    features = s.get("features") or {}
+
+    return {
+        "side": side,
+        "confidence": conf,
+        "reason": reason,
+        "features": features,
+    }
+
+# =========================
 # CONFIDENCE HELPERS
 # =========================
 
@@ -159,6 +194,7 @@ def confidence_to_strict_loss_streak(conf: float) -> int:
     return MAX_LOSS_STREAK
 
 def generate_confidence() -> float:
+    # fallback only
     return float(random.uniform(CONF_GEN_MIN, CONF_GEN_MAX))
 
 # =========================
@@ -223,7 +259,6 @@ def simulate_trade(risk_usd: float) -> float:
 
     # "Winning-style" paper sim edge
     win = random.random() > WIN_THRESHOLD
-
     pnl = risk_usd * random.uniform(0.6, 1.6) if win else -risk_usd
 
     state["equity"] += pnl
@@ -295,8 +330,18 @@ def push_pet_and_equity() -> None:
 # MAIN LOOP
 # =========================
 
+_market_i = 0
+
+def pick_market() -> str:
+    global _market_i
+    if not MARKETS:
+        return "BTCUSDT"
+    m = MARKETS[_market_i % len(MARKETS)]
+    _market_i += 1
+    return m
+
 def run() -> None:
-    log.info("Bot started. API_URL=%s cycle=%ss markets=%s", API_URL, CYCLE_SECONDS, MARKETS)
+    log.info("Bot started. API_URL=%s cycle=%ss markets=%s USE_SIGNAL=%s", API_URL, CYCLE_SECONDS, MARKETS, USE_SIGNAL)
 
     while True:
         pet_tick()
@@ -321,14 +366,44 @@ def run() -> None:
             time.sleep(CYCLE_SECONDS)
             continue
 
-        # Confidence decision
-        confidence = generate_confidence()
+        # =========================
+        # SIGNAL DECISION (NEW)
+        # =========================
+        market = pick_market()
 
-        if confidence < CONF_MIN_TRADE:
-            log_event("decision", "skip_trade_low_confidence", {"confidence": confidence, "min": CONF_MIN_TRADE})
+        side = "hold"
+        confidence = 0.5
+        reason = "fallback"
+        features: Dict[str, Any] = {}
+
+        if USE_SIGNAL:
+            sig = get_signal(market)
+            side = sig["side"]
+            confidence = float(sig["confidence"])
+            reason = sig["reason"]
+            features = sig.get("features") or {}
+
+            # if the API is down or missing endpoint, /signal might return None -> handled above
+            # If signal seems "bad", we'll still gate it below
+        else:
+            confidence = generate_confidence()
+            side = "buy" if random.random() > 0.5 else "sell"
+            reason = "random_fallback"
+
+        # Gate: HOLD or low confidence => skip trade
+        if side == "hold" or confidence < CONF_MIN_TRADE:
+            log_event("decision", "hold_or_low_confidence", {
+                "market": market,
+                "side": side,
+                "confidence": confidence,
+                "min": CONF_MIN_TRADE,
+                "reason": reason,
+                "features": features,
+            })
             push_heartbeat(prices_ok=True)
             push_pet_and_equity()
-            log.info("Skip trade | confidence=%.3f < %.3f", confidence, CONF_MIN_TRADE)
+
+            log.info("Skip trade | market=%s side=%s conf=%.3f reason=%s", market, side, confidence, reason)
             time.sleep(CYCLE_SECONDS)
             continue
 
@@ -340,10 +415,14 @@ def run() -> None:
         strict_loss_streak = confidence_to_strict_loss_streak(confidence)
 
         log_event("decision", "trade_decision", {
+            "market": market,
+            "side": side,
             "confidence": confidence,
             "size_mult": size_mult,
             "risk_usd": risk_usd,
-            "strict_loss_streak": strict_loss_streak
+            "strict_loss_streak": strict_loss_streak,
+            "reason": reason,
+            "features": features,
         })
 
         pnl = simulate_trade(risk_usd=risk_usd)
@@ -352,41 +431,48 @@ def run() -> None:
         dd = drawdown_pct()
 
         log.info(
-            "Trade #%d | PnL %.2f | Equity %.2f | DD %.2f%% | LossStreak %d (thr %d) | Conf %.2f | SizeMult %.2f | PetHP %.1f",
-            state["total_trades"], pnl, state["equity"], dd, state["loss_streak"], strict_loss_streak,
-            confidence, size_mult, state["pet"]["health"]
+            "Trade #%d | %s %s | PnL %.2f | Equity %.2f | DD %.2f%% | LossStreak %d (thr %d) | Conf %.2f | SizeMult %.2f | Reason %s",
+            state["total_trades"], market, side.upper(), pnl, state["equity"], dd,
+            state["loss_streak"], strict_loss_streak, confidence, size_mult, reason
         )
 
         # Cryo triggers
         if state["loss_streak"] >= strict_loss_streak:
             enter_cryo("loss_streak", {
+                "market": market,
                 "loss_streak": state["loss_streak"],
                 "threshold": strict_loss_streak,
                 "confidence": confidence,
                 "drawdown_pct": dd,
-                "equity": state["equity"]
+                "equity": state["equity"],
+                "side": side,
+                "reason": reason,
             })
 
         if dd >= MAX_DRAWDOWN_PCT:
             enter_cryo("max_drawdown", {
+                "market": market,
                 "drawdown_pct": dd,
                 "peak": state["peak_equity"],
                 "equity": state["equity"],
-                "confidence": confidence
+                "confidence": confidence,
+                "side": side,
+                "reason": reason,
             })
 
         push_heartbeat(prices_ok=True)
         push_pet_and_equity()
 
+        # Trade log driven by API brain
         _post("/ingest/trade", {
             "time_utc": utc_now(),
-            "market": "BTCUSDT",
-            "side": "buy" if pnl >= 0 else "sell",
+            "market": market,
+            "side": side,
             "size_usd": float(risk_usd),
-            "price": float(prices.get("BTCUSDT", 0)),
+            "price": float(prices.get(market, 0)),
             "pnl_usd": float(pnl),
             "confidence": float(confidence),
-            "reason": "paper_sim_confidence_scaled",
+            "reason": reason,
         })
 
         time.sleep(CYCLE_SECONDS)
