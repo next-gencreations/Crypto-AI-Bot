@@ -526,7 +526,7 @@ def run() -> None:
         # Brain feedback (learning)
         if USE_BRAIN_V2 and brain is not None:
             try:
-                brain.record_trade(float(pnl))
+                brain.record_trade(float(pnl), equity_after=float(state["equity"]))
             except Exception as e:
                 log.warning("BrainV2 record_trade failed: %s", e)
 
