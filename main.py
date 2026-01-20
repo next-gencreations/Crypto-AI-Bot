@@ -29,32 +29,45 @@ MARKETS = [m.strip() for m in (os.getenv("MARKETS", "BTCUSDT,ETHUSDT").split(","
 # CONFIDENCE -> BEHAVIOUR
 # =========================
 
-# Gate: skip trades below this confidence (lower = trades more often)
 CONF_MIN_TRADE = float(os.getenv("CONF_MIN_TRADE", "0.52"))
 
-# Confidence band used for scaling size and pet effects
 CONF_LOW = float(os.getenv("CONF_LOW", "0.58"))
 CONF_HIGH = float(os.getenv("CONF_HIGH", "0.78"))
 
-# Size multiplier at low/high confidence
 SIZE_MIN_MULT = float(os.getenv("SIZE_MIN_MULT", "0.80"))
 SIZE_MAX_MULT = float(os.getenv("SIZE_MAX_MULT", "1.80"))
 
-# Stricter freezing when confidence is low
 STRICT_STREAK_LOWCONF = int(os.getenv("STRICT_STREAK_LOWCONF", "2"))
 STRICT_STREAK_MIDCONF = int(os.getenv("STRICT_STREAK_MIDCONF", "3"))
 STRICT_STREAK_LOW_CUTOFF = float(os.getenv("STRICT_STREAK_LOW_CUTOFF", "0.52"))
 STRICT_STREAK_MID_CUTOFF = float(os.getenv("STRICT_STREAK_MID_CUTOFF", "0.60"))
 
-# TEMP confidence generator until real model plugged in (used if /signal fails)
 CONF_GEN_MIN = float(os.getenv("CONF_GEN_MIN", "0.55"))
 CONF_GEN_MAX = float(os.getenv("CONF_GEN_MAX", "0.90"))
 
-# Paper-sim "edge" (higher = wins more often). 0.42 => ~58% win rate.
 WIN_THRESHOLD = float(os.getenv("WIN_THRESHOLD", "0.42"))
 
-# Use /signal endpoint (turn off if needed)
 USE_SIGNAL = (os.getenv("USE_SIGNAL", "1").strip().lower() not in ("0", "false", "no"))
+
+# =========================
+# BRAIN V2 (NEW)
+# =========================
+
+USE_BRAIN_V2 = (os.getenv("USE_BRAIN_V2", "1").strip().lower() not in ("0", "false", "no"))
+
+# Optional “hard safety” switches controlled by BrainV2 governor logic below
+MIN_EQUITY_HARD_STOP = float(os.getenv("MIN_EQUITY_HARD_STOP", "100"))  # if equity falls under this, freeze
+COOLDOWN_AFTER_LOSS_SEC = int(os.getenv("COOLDOWN_AFTER_LOSS_SEC", "90"))  # pause a bit after a loss
+MAX_RISK_CAP_PCT = float(os.getenv("MAX_RISK_CAP_PCT", "3.0"))  # max risk per trade as % equity after scaling
+
+brain = None
+if USE_BRAIN_V2:
+    try:
+        # expects brain_v2.py in same folder as main.py
+        from brain_v2 import BrainV2  # type: ignore
+        brain = BrainV2()
+    except Exception:
+        brain = None
 
 # =========================
 # LOGGING
@@ -75,6 +88,7 @@ state: Dict[str, Any] = {
     "loss_streak": 0,
     "total_trades": 0,
     "total_pnl_usd": 0.0,
+    "cooldown_until_utc": "",
     "pet": {
         "name": "TradePet",
         "sex": os.getenv("PET_SEX", "boy"),
@@ -141,17 +155,15 @@ def log_event(ev_type: str, message: str, details: Optional[Dict[str, Any]] = No
     })
 
 # =========================
-# SIGNAL HELPER (NEW)
+# SIGNAL HELPER
 # =========================
 
 def get_signal(market: str = "BTCUSDT") -> Dict[str, Any]:
     """
     Calls the API brain: GET /signal?market=BTCUSDT
-    Expected response shape:
+    Expected response:
       { side: "buy|sell|hold", confidence: 0..1, reason: "...", features: {...} }
-    Safe defaults if missing.
     """
-    # IMPORTANT: _get expects a path starting with /
     s = _get(f"/signal?market={market}") or {}
     side = (s.get("side") or "hold").lower().strip()
     if side not in ("buy", "sell", "hold"):
@@ -165,12 +177,7 @@ def get_signal(market: str = "BTCUSDT") -> Dict[str, Any]:
     reason = s.get("reason") or "unknown"
     features = s.get("features") or {}
 
-    return {
-        "side": side,
-        "confidence": conf,
-        "reason": reason,
-        "features": features,
-    }
+    return {"side": side, "confidence": conf, "reason": reason, "features": features}
 
 # =========================
 # CONFIDENCE HELPERS
@@ -183,7 +190,7 @@ def confidence_to_size_mult(conf: float) -> float:
     c = clamp(conf, CONF_LOW, CONF_HIGH)
     if CONF_HIGH == CONF_LOW:
         return 1.0
-    t = (c - CONF_LOW) / (CONF_HIGH - CONF_LOW)  # 0..1
+    t = (c - CONF_LOW) / (CONF_HIGH - CONF_LOW)
     return SIZE_MIN_MULT + t * (SIZE_MAX_MULT - SIZE_MIN_MULT)
 
 def confidence_to_strict_loss_streak(conf: float) -> int:
@@ -194,7 +201,6 @@ def confidence_to_strict_loss_streak(conf: float) -> int:
     return MAX_LOSS_STREAK
 
 def generate_confidence() -> float:
-    # fallback only
     return float(random.uniform(CONF_GEN_MIN, CONF_GEN_MAX))
 
 # =========================
@@ -257,7 +263,6 @@ def pet_on_trade(pnl: float, confidence: float) -> None:
 def simulate_trade(risk_usd: float) -> float:
     risk_usd = max(0.0, float(risk_usd))
 
-    # "Winning-style" paper sim edge
     win = random.random() > WIN_THRESHOLD
     pnl = risk_usd * random.uniform(0.6, 1.6) if win else -risk_usd
 
@@ -327,6 +332,28 @@ def push_pet_and_equity() -> None:
     _post("/ingest/equity", {"time_utc": utc_now(), "equity_usd": state["equity"]})
 
 # =========================
+# UTILS
+# =========================
+
+def _is_in_cooldown() -> bool:
+    cu = state.get("cooldown_until_utc") or ""
+    if not cu:
+        return False
+    try:
+        now = datetime.now(timezone.utc)
+        until = datetime.fromisoformat(cu.replace("Z", "+00:00"))
+        return now < until
+    except Exception:
+        return False
+
+def _set_cooldown(seconds: int) -> None:
+    if seconds <= 0:
+        state["cooldown_until_utc"] = ""
+        return
+    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)  # type: ignore
+    state["cooldown_until_utc"] = until.replace(microsecond=0).isoformat()
+
+# =========================
 # MAIN LOOP
 # =========================
 
@@ -341,7 +368,8 @@ def pick_market() -> str:
     return m
 
 def run() -> None:
-    log.info("Bot started. API_URL=%s cycle=%ss markets=%s USE_SIGNAL=%s", API_URL, CYCLE_SECONDS, MARKETS, USE_SIGNAL)
+    log.info("Bot started. API_URL=%s cycle=%ss markets=%s USE_SIGNAL=%s USE_BRAIN_V2=%s",
+             API_URL, CYCLE_SECONDS, MARKETS, USE_SIGNAL, bool(brain))
 
     while True:
         pet_tick()
@@ -361,13 +389,28 @@ def run() -> None:
 
             push_heartbeat(prices_ok=True)
             push_pet_and_equity()
-
             log.info("%s active (%s). No trading.", mode, ctrl.get("cryo_reason") or ctrl.get("pause_reason"))
             time.sleep(CYCLE_SECONDS)
             continue
 
+        # Hard stop (safety)
+        if state["equity"] <= MIN_EQUITY_HARD_STOP:
+            enter_cryo("min_equity_hard_stop", {"equity": state["equity"], "threshold": MIN_EQUITY_HARD_STOP})
+            push_heartbeat(prices_ok=True)
+            push_pet_and_equity()
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        # Local cooldown (optional)
+        if _is_in_cooldown():
+            log_event("decision", "cooldown_active", {"cooldown_until_utc": state.get("cooldown_until_utc")})
+            push_heartbeat(prices_ok=True)
+            push_pet_and_equity()
+            time.sleep(CYCLE_SECONDS)
+            continue
+
         # =========================
-        # SIGNAL DECISION (NEW)
+        # SIGNAL DECISION
         # =========================
         market = pick_market()
 
@@ -382,35 +425,90 @@ def run() -> None:
             confidence = float(sig["confidence"])
             reason = sig["reason"]
             features = sig.get("features") or {}
-
-            # if the API is down or missing endpoint, /signal might return None -> handled above
-            # If signal seems "bad", we'll still gate it below
         else:
             confidence = generate_confidence()
             side = "buy" if random.random() > 0.5 else "sell"
             reason = "random_fallback"
 
+        # =========================
+        # BRAIN V2 GOVERNOR (NEW)
+        # =========================
+        # BrainV2 can veto trades, alter confidence, or suggest reduced sizing.
+        brain_decision: Dict[str, Any] = {}
+        if brain is not None:
+            try:
+                brain_decision = brain.decide(
+                    market=market,
+                    side=side,
+                    confidence=confidence,
+                    equity=float(state["equity"]),
+                    peak_equity=float(state["peak_equity"]),
+                    loss_streak=int(state["loss_streak"]),
+                    drawdown_pct=float(drawdown_pct()),
+                    survival_mode=survival_mode(),
+                    features=features,
+                    now_utc=utc_now(),
+                ) or {}
+            except Exception as e:
+                brain_decision = {"error": str(e)}
+
+        # Apply BrainV2 overrides (safe defaults)
+        # Expected optional keys:
+        #   allow: bool
+        #   side: "buy|sell|hold"
+        #   confidence: float
+        #   size_mult: float
+        #   note: str
+        if brain_decision:
+            if isinstance(brain_decision.get("side"), str):
+                side = brain_decision["side"].lower().strip()
+                if side not in ("buy", "sell", "hold"):
+                    side = "hold"
+            if brain_decision.get("confidence") is not None:
+                try:
+                    confidence = float(brain_decision["confidence"])
+                except Exception:
+                    pass
+
+        allow = True
+        if brain_decision and brain_decision.get("allow") is False:
+            allow = False
+
         # Gate: HOLD or low confidence => skip trade
-        if side == "hold" or confidence < CONF_MIN_TRADE:
-            log_event("decision", "hold_or_low_confidence", {
+        if (not allow) or side == "hold" or confidence < CONF_MIN_TRADE:
+            log_event("decision", "brain_veto_or_low_confidence", {
                 "market": market,
                 "side": side,
                 "confidence": confidence,
                 "min": CONF_MIN_TRADE,
+                "allow": allow,
                 "reason": reason,
                 "features": features,
+                "brain": brain_decision,
             })
             push_heartbeat(prices_ok=True)
             push_pet_and_equity()
-
-            log.info("Skip trade | market=%s side=%s conf=%.3f reason=%s", market, side, confidence, reason)
+            log.info("Skip trade | market=%s side=%s conf=%.3f allow=%s reason=%s", market, side, confidence, allow, reason)
             time.sleep(CYCLE_SECONDS)
             continue
 
         # Size/risk scaling
         size_mult = confidence_to_size_mult(confidence)
-        base_risk_usd = state["equity"] * RISK_PER_TRADE
-        risk_usd = base_risk_usd * size_mult
+
+        # Brain override size_mult if provided
+        if brain_decision and brain_decision.get("size_mult") is not None:
+            try:
+                size_mult = float(brain_decision["size_mult"])
+            except Exception:
+                pass
+
+        base_risk_usd = float(state["equity"]) * float(RISK_PER_TRADE)
+        risk_usd = float(base_risk_usd) * float(size_mult)
+
+        # Hard cap risk to equity % (safety)
+        max_risk = float(state["equity"]) * (MAX_RISK_CAP_PCT / 100.0)
+        if risk_usd > max_risk:
+            risk_usd = max_risk
 
         strict_loss_streak = confidence_to_strict_loss_streak(confidence)
 
@@ -423,8 +521,10 @@ def run() -> None:
             "strict_loss_streak": strict_loss_streak,
             "reason": reason,
             "features": features,
+            "brain": brain_decision,
         })
 
+        # Execute paper trade
         pnl = simulate_trade(risk_usd=risk_usd)
         pet_on_trade(pnl, confidence)
 
@@ -435,6 +535,31 @@ def run() -> None:
             state["total_trades"], market, side.upper(), pnl, state["equity"], dd,
             state["loss_streak"], strict_loss_streak, confidence, size_mult, reason
         )
+
+        # Inform BrainV2 of outcome
+        if brain is not None:
+            try:
+                brain.on_trade_result(
+                    market=market,
+                    side=side,
+                    pnl_usd=float(pnl),
+                    equity=float(state["equity"]),
+                    drawdown_pct=float(dd),
+                    loss_streak=int(state["loss_streak"]),
+                    confidence=float(confidence),
+                    now_utc=utc_now(),
+                )
+            except Exception:
+                pass
+
+        # Optional cooldown after a loss
+        if pnl < 0 and COOLDOWN_AFTER_LOSS_SEC > 0:
+            try:
+                from datetime import timedelta
+                until = datetime.now(timezone.utc) + timedelta(seconds=int(COOLDOWN_AFTER_LOSS_SEC))
+                state["cooldown_until_utc"] = until.replace(microsecond=0).isoformat()
+            except Exception:
+                state["cooldown_until_utc"] = ""
 
         # Cryo triggers
         if state["loss_streak"] >= strict_loss_streak:
@@ -447,6 +572,7 @@ def run() -> None:
                 "equity": state["equity"],
                 "side": side,
                 "reason": reason,
+                "brain": brain_decision,
             })
 
         if dd >= MAX_DRAWDOWN_PCT:
@@ -458,12 +584,12 @@ def run() -> None:
                 "confidence": confidence,
                 "side": side,
                 "reason": reason,
+                "brain": brain_decision,
             })
 
         push_heartbeat(prices_ok=True)
         push_pet_and_equity()
 
-        # Trade log driven by API brain
         _post("/ingest/trade", {
             "time_utc": utc_now(),
             "market": market,
