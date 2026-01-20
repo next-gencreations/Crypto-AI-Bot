@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 import time
 
 # ==========================
@@ -56,7 +56,7 @@ class BrainV2:
         self.min_conf_normal = 0.55
         self.min_conf_defensive = 0.65
 
-        # volatility thresholds (ATR is assumed as fraction, e.g. 0.01 = 1%)
+        # volatility thresholds (ATR assumed as fraction, e.g. 0.01 = 1%)
         self.atr_volatile = 0.03
         self.atr_danger = 0.06
 
@@ -97,7 +97,6 @@ class BrainV2:
     # Survival Logic
     # --------------------------
     def survival_mode(self) -> str:
-        # drawdown_pct is 0..100
         if self.drawdown_pct >= 15.0:
             return "EMERGENCY"
         if self.loss_streak >= 3:
@@ -132,10 +131,6 @@ class BrainV2:
     # Decision Engine
     # --------------------------
     def decide(self, indicators: Dict, signal_score: float) -> BrainDecision:
-        """
-        signal_score is expected 0..1 coming from /signal confidence.
-        indicators provide atr/ema_slope/adx + optional overrides.
-        """
         now = time.time()
 
         market = self.detect_regime(indicators)
@@ -153,9 +148,9 @@ class BrainV2:
 
         # Combine signal with market quality
         s = float(signal_score or 0.0)
-        confidence = s * market.confidence  # 0..1-ish
+        confidence = s * market.confidence
 
-        # Loss-streak penalty (makes bot more selective after consecutive losses)
+        # Loss-streak penalty
         if self.loss_streak >= 2:
             confidence *= 0.90
         if self.loss_streak >= 3:
@@ -176,7 +171,6 @@ class BrainV2:
 
         # regime filters
         if market.regime == "volatile":
-            # block trades unless very confident
             allow = allow and (confidence >= 0.70)
             risk_mult *= 0.75
         if market.regime == "danger":
@@ -200,11 +194,7 @@ class BrainV2:
     # --------------------------
     # Learning Feedback
     # --------------------------
-    def record_trade(self, pnl: float, equity_after: float = None):
-        """
-        Call this after each trade. If equity_after is provided,
-        drawdown is computed properly as a % from peak.
-        """
+    def record_trade(self, pnl: float, equity_after: Optional[float] = None):
         pnl = float(pnl or 0.0)
 
         if pnl > 0:
