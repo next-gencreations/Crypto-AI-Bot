@@ -476,30 +476,58 @@ def run() -> None:
                 brain_state = "BRAIN_ERROR"
                 brain_reason = f"brain_exception: {e}"
 
-        # Gate: HOLD or low confidence OR brain says no
-        if side == "hold" or confidence < CONF_MIN_TRADE or (USE_BRAIN_V2 and brain is not None and not brain_allow):
-            log_event("decision", "hold_or_blocked", {
-                "market": market,
-                "side": side,
-                "confidence": confidence,
-                "min": CONF_MIN_TRADE,
-                "reason": reason,
-                "features": features,
-                "brain_active": bool(USE_BRAIN_V2 and brain is not None),
-                "brain_allow_trade": brain_allow,
-                "brain_state": brain_state,
-                "brain_reason": brain_reason,
-                "brain_risk_multiplier": brain_risk_mult,
-            })
-            push_heartbeat(prices_ok=True)
-            push_pet_and_equity()
+        # -------------------------
+# Brain V2 gate + risk
+# -------------------------
 
-            log.info(
-                "Skip | market=%s side=%s conf=%.3f reason=%s | brain=%s allow=%s risk=%.2f",
-                market, side, confidence, reason, brain_state or "OFF", brain_allow, brain_risk_mult
-            )
-            time.sleep(CYCLE_SECONDS)
-            continue
+# Build indicators dict (use whatever your /signal returns; safe fallbacks)
+indicators = {
+    "atr": float((features or {}).get("atr", 0.0) or 0.0),
+    "ema_slope": float((features or {}).get("trend", 0.0) or 0.0),
+    "adx": float((features or {}).get("adx", 0.0) or 0.0),
+}
+
+# Brain uses SIGNAL confidence (0..1)
+brain_decision = brain.decide(indicators=indicators, signal_score=float(confidence))
+
+# Still respect HOLD from signal
+if side == "hold":
+    log_event("decision", "brain_hold_signal_hold", {
+        "market": market,
+        "side": side,
+        "confidence": confidence,
+        "reason": reason,
+        "features": features,
+        "brain_state": brain_decision.brain_state,
+        "brain_reason": brain_decision.reason,
+    })
+    push_heartbeat(prices_ok=True)
+    push_pet_and_equity()
+    log.info("Skip trade | market=%s side=%s conf=%.3f reason=%s (brain=%s)", market, side, confidence, reason, brain_decision.brain_state)
+    time.sleep(CYCLE_SECONDS)
+    continue
+
+# Brain gate (main decision)
+if not brain_decision.allow_trade:
+    log_event("decision", "brain_blocked_trade", {
+        "market": market,
+        "side": side,
+        "confidence": confidence,
+        "reason": reason,
+        "features": features,
+        "brain_state": brain_decision.brain_state,
+        "brain_conf": brain_decision.confidence,
+        "brain_risk_mult": brain_decision.risk_multiplier,
+        "brain_reason": brain_decision.reason,
+    })
+    push_heartbeat(prices_ok=True)
+    push_pet_and_equity()
+    log.info(
+        "Brain blocked | market=%s side=%s conf=%.3f brain_conf=%.3f state=%s",
+        market, side, confidence, brain_decision.confidence, brain_decision.brain_state
+    )
+    time.sleep(CYCLE_SECONDS)
+    continue
 
         # Size/risk scaling
         size_mult = confidence_to_size_mult(confidence)
