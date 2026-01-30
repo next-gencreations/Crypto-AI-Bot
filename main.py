@@ -1,34 +1,43 @@
 cat > main.py <<'PY'
 # -*- coding: utf-8 -*-
 """
-Crypto-AI-Bot (paper mode) — Universe Scanning (Option A)
+Crypto-AI-Bot (paper mode) - Option A: Universe scanning via Coinbase public prices
 
-What this does:
-- Each cycle, scans many markets (UNIVERSE) by asking the API for /signal
-- Picks the best market by confidence (abs(signal))
-- Passes that best pick through BrainV2 gate + risk multiplier
-- Simulates a paper trade and posts events/heartbeat so dashboard/vault updates
+- No dependency on API /signal endpoint (avoids your 404 issue)
+- Scans many coins, picks best by simple momentum score
+- Feeds confidence into BrainV2 (gate + risk multiplier)
+- Posts heartbeat + paper events to your Render API so Vault/Dashboard updates
 
-Works with your existing API endpoints:
-- /signal?market=...
-- /ingest/heartbeat
-- /ingest/pet
-- /ingest/equity
-- /ingest/prices
-- /vault/unlock
+ENV:
+  API_BASE        default: https://crypto-ai-api-1-7cte.onrender.com
+  VAULT_PIN       default: 4567
+  CYCLE_SECONDS   default: 15
+  UNIVERSE        comma list, default provided
+  HISTORY_LEN     default: 30
+  RISK_PER_TRADE  default: 0.015 (1.5% of equity)
+  MAX_RISK_MULT   default: 1.50
+  MIN_CONF        default: 0.20 (below this = no trade)
+  USE_BRAIN       default: 1  (0 disables BrainV2 gate for testing)
+
+Notes:
+- Uses Coinbase Exchange public endpoints:
+    https://api.exchange.coinbase.com/products/<PRODUCT>/ticker
+  where PRODUCT like BTC-USD, ETH-USD etc
 """
 
 import os
 import time
+import math
 import random
 import logging
-import requests
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-# =========================
-# BRAIN V2 IMPORT
-# =========================
+import requests
+
+# ----------------------------
+# Brain V2 import
+# ----------------------------
 try:
     from brain_v2 import BrainV2
 except Exception as e:
@@ -37,514 +46,328 @@ except Exception as e:
 else:
     _brain_import_error = ""
 
-# =========================
-# CONFIG
-# =========================
+# ----------------------------
+# Config
+# ----------------------------
+API_BASE = os.getenv("API_BASE", "https://crypto-ai-api-1-7cte.onrender.com").rstrip("/")
+VAULT_PIN = os.getenv("VAULT_PIN", "4567")
 
-API_URL = os.getenv("API_BASE") or os.getenv("API_URL") or "https://crypto-ai-api-1-7cte.onrender.com"
-VAULT_PIN = os.getenv("VAULT_PIN") or os.getenv("VAULT_CODE") or os.getenv("PIN") or os.getenv("VAULT_PASS") or os.getenv("VAULT_PW") or os.getenv("VAULT_P") or os.getenv("VAULT") or os.getenv("VAULT_KEY") or os.getenv("VAULT_SECRET") or os.getenv("VAULT_TOKEN") or os.getenv("VAULT_UNLOCK") or os.getenv("VAULT_PASSWORD") or os.getenv("VAULT_PASSCODE") or os.getenv("VAULT_PIN_CODE") or os.getenv("VAULTPIN") or os.getenv("PIN_CODE") or os.getenv("PASSCODE") or os.getenv("PASSWORD") or os.getenv("PASS") or os.getenv("CODE") or os.getenv("VAULTPINCODE") or os.getenv("VAULTPASSCODE") or os.getenv("VAULT_PASS_CODE") or os.getenv("VAULT_PINCODE") or os.getenv("VAULTPIN_CODE") or os.getenv("VAULTPASS_CODE") or os.getenv("VAULTPASS") or os.getenv("VAULTPASSWD") or os.getenv("VAULTPWD") or os.getenv("VAULTPW") or os.getenv("VAULT-PIN") or os.getenv("VAULT-PASS") or os.getenv("VAULT-PASSWORD") or os.getenv("VAULT-PASSCODE") or os.getenv("VAULT-PINCODE") or os.getenv("VAULT-PIN-CODE") or os.getenv("VAULT-PASS-CODE") or os.getenv("VAULT_PASSWORD_CODE") or os.getenv("VAULT_PIN_CODE") or os.getenv("VAULTPASSCODE") or os.getenv("VAULTPINCODE") or os.getenv("VAULT_UNLOCK_PIN") or os.getenv("VAULT_UNLOCK_CODE") or os.getenv("VAULT_UNLOCK_PASS") or os.getenv("VAULT_UNLOCK_PASSWORD") or os.getenv("VAULT_UNLOCK_PASSCODE") or os.getenv("VAULT_UNLOCK_PINCODE") or os.getenv("VAULT_UNLOCK_PIN_CODE") or os.getenv("VAULT_UNLOCK_PASS_CODE") or os.getenv("VAULT_UNLOCK_PASSWORD_CODE") or os.getenv("VAULT_UNLOCK_PINCODE") or os.getenv("VAULT_UNLOCK_PASSCODE") or os.getenv("VAULT_UNLOCKPIN") or os.getenv("VAULT_UNLOCKPASS") or os.getenv("VAULT_UNLOCKPASSWORD") or os.getenv("VAULT_UNLOCKPASSCODE") or os.getenv("VAULT_UNLOCKPINCODE") or os.getenv("VAULT_UNLOCK_PINCODE") or os.getenv("VAULT_UNLOCK_PASSCODE") or os.getenv("VAULT_UNLOCK_PIN_CODE") or os.getenv("VAULT_UNLOCK_PASS_CODE") or os.getenv("VAULT_UNLOCK_PASSWORD_CODE") or os.getenv("VAULT_UNLOCK_PIN_CODE") or os.getenv("VAULT_UNLOCK_PASS_CODE") or os.getenv("VAULT_UNLOCK_PASSWORD_CODE") or os.getenv("VAULT_UNLOCK_PINCODE") or os.getenv("VAULT_UNLOCK_PASSCODE") or os.getenv("VAULT_UNLOCK_PIN") or os.getenv("VAULT_UNLOCK_CODE") or os.getenv("VAULT_UNLOCK_PASS") or os.getenv("VAULT_UNLOCK_PASSWORD") or os.getenv("VAULT_UNLOCK_PASSCODE") or os.getenv("VAULT_UNLOCK_PINCODE") or "4567"
+COINBASE_BASE = "https://api.exchange.coinbase.com"
 
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", os.getenv("BOT_SLEEP_SEC", "15")))
-CONF_MIN_TRADE = float(os.getenv("CONF_MIN_TRADE", "0.62"))
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "15"))
+HISTORY_LEN = int(os.getenv("HISTORY_LEN", "30"))
 
-# Paper sim settings
-START_EQUITY = float(os.getenv("START_EQUITY", "1000"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))  # 1.5% base
-WIN_THRESHOLD = float(os.getenv("WIN_THRESHOLD", "0.52"))     # higher = more losses; 0.52 is slightly tough
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))
+MAX_RISK_MULT = float(os.getenv("MAX_RISK_MULT", "1.50"))
+MIN_CONF = float(os.getenv("MIN_CONF", "0.20"))
 
-# Cryo safety
-MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "30"))
-MAX_LOSS_STREAK_DEFAULT = int(os.getenv("MAX_LOSS_STREAK", "6"))
-CRYO_SECONDS = int(os.getenv("CRYO_SECONDS", "1800"))
+USE_BRAIN = os.getenv("USE_BRAIN", "1").strip() != "0"
 
-# Universe scanning
-# Use same market codes your API uses (your screenshots show BTCUSDT/ETHUSDT)
-UNIVERSE = os.getenv(
-    "UNIVERSE",
-    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LTCUSDT,BNBUSDT,LINKUSDT,TRXUSDT,DOTUSDT,ATOMUSDT,NEARUSDT,OPUSDT,ARBUSDT,MATICUSDT,ETCUSDT,BCHUSDT,UNIUSDT"
+DEFAULT_UNIVERSE = (
+    "BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,DOGE-USD,AVAX-USD,LINK-USD,DOT-USD,ATOM-USD,"
+    "LTC-USD,BCH-USD,UNI-USD,OP-USD,ARB-USD,APT-USD,INJ-USD,NEAR-USD,MATIC-USD,TRX-USD"
 )
-MARKETS: List[str] = [m.strip() for m in UNIVERSE.split(",") if m.strip()]
-SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "12"))   # how many markets to scan each cycle (random sample)
-SCAN_SHUFFLE = os.getenv("SCAN_SHUFFLE", "1") != "0"
+UNIVERSE = [x.strip().upper() for x in os.getenv("UNIVERSE", DEFAULT_UNIVERSE).split(",") if x.strip()]
 
-USE_BRAIN_V2 = os.getenv("USE_BRAIN_V2", "1") != "0"
-USE_SIGNAL = os.getenv("USE_SIGNAL", "1") != "0"  # call API /signal
-
-# =========================
-# LOGGING
-# =========================
+# ----------------------------
+# Logging
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("crypto-ai-bot")
+log = logging.getLogger("bot")
 
-# =========================
-# STATE
-# =========================
-state: Dict[str, Any] = {
-    "equity": START_EQUITY,
-    "peak_equity": START_EQUITY,
-    "wins": 0,
-    "losses": 0,
-    "loss_streak": 0,
-    "total_trades": 0,
-    "total_pnl_usd": 0.0,
-    "pet": {
-        "name": os.getenv("COMPANION_NAME", "TradePet"),
-        "stage": "active",
-        "mood": "idle",
-        "health": 100.0,
-        "hunger": 0.0,
-        "growth": 0.0,
-        "updated_utc": None,
-    }
-}
-
-brain = None
-if USE_BRAIN_V2 and BrainV2 is not None:
-    try:
-        brain = BrainV2()
-        log.info("BrainV2 loaded OK")
-    except Exception as e:
-        brain = None
-        log.warning("BrainV2 init failed: %s", e)
-
-# =========================
-# HELPERS
-# =========================
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def _get(path: str, params: Optional[dict] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def safe_get_json(url: str, headers: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
     try:
-        r = requests.get(f"{API_URL}{path}", params=params, timeout=timeout)
+        r = requests.get(url, headers=headers or {}, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        log.warning("GET %s failed: %s", path, e)
+        log.warning(f"GET failed: {url} :: {e}")
         return None
 
-def _post(path: str, payload: Dict[str, Any], timeout: int = 15) -> None:
+def safe_post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: int = 10) -> Optional[dict]:
     try:
-        requests.post(f"{API_URL}{path}", json=payload, timeout=timeout)
-    except Exception as e:
-        log.warning("POST %s failed: %s", path, e)
-
-def unlock_vault() -> Optional[str]:
-    try:
-        r = requests.post(f"{API_URL}/vault/unlock", json={"pin": VAULT_PIN}, timeout=15)
+        r = requests.post(url, json=payload, headers=headers or {}, timeout=timeout)
         r.raise_for_status()
-        j = r.json()
-        if not j.get("ok"):
-            raise RuntimeError(str(j))
-        return j.get("token")
+        return r.json() if r.text else {"ok": True}
     except Exception as e:
-        log.warning("Vault unlock failed (continuing anyway): %s", e)
+        log.warning(f"POST failed: {url} :: {e}")
         return None
 
-def api_control() -> Dict[str, Any]:
-    # If API has /control, use it. Else default to ACTIVE.
-    j = _get("/control")
-    if j and isinstance(j, dict) and j.get("ok"):
-        return {
-            "state": (j.get("state") or "ACTIVE").upper(),
-            "pause_reason": j.get("pause_reason"),
-            "cryo_reason": j.get("cryo_reason"),
-        }
-    return {"state": "ACTIVE", "pause_reason": None, "cryo_reason": None}
+# ----------------------------
+# Render API calls (Vault + paper)
+# ----------------------------
+def unlock_vault() -> Optional[str]:
+    j = safe_post_json(f"{API_BASE}/vault/unlock", {"pin": VAULT_PIN}, timeout=15)
+    if not j or not j.get("ok"):
+        return None
+    return j.get("token")
 
-def log_event(kind: str, msg: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    _post("/ingest/log", {
-        "time_utc": utc_now(),
-        "level": "info",
-        "kind": kind,
-        "msg": msg,
-        "extra": extra or {}
-    })
+def get_data() -> Optional[dict]:
+    return safe_get_json(f"{API_BASE}/data", timeout=15)
 
-# =========================
-# PET LOGIC (simple but stable)
-# =========================
+def post_heartbeat(open_positions: int, equity_usd: float, last_pnl_usd: float) -> None:
+    safe_post_json(
+        f"{API_BASE}/bot/heartbeat",
+        {"open_positions": open_positions, "equity_usd": equity_usd, "last_pnl_usd": last_pnl_usd},
+        timeout=10,
+    )
 
-def pet_tick() -> None:
-    p = state["pet"]
-
-    # hunger rises slowly over time
-    p["hunger"] = min(100.0, p["hunger"] + 0.35)
-
-    # health drifts down if hunger is high
-    if p["hunger"] > 80:
-        p["health"] = max(0.0, p["health"] - 0.35)
-
-    # mood from vitals
-    if p["health"] <= 5:
-        p["stage"] = "cryo"
-        p["mood"] = "cryo"
-    else:
-        p["stage"] = "active"
-        if p["health"] < 35:
-            p["mood"] = "sick"
-        elif p["hunger"] > 90:
-            p["mood"] = "starving"
-        elif p["hunger"] > 75:
-            p["mood"] = "hungry"
-        else:
-            p["mood"] = "idle"
-
-    p["updated_utc"] = utc_now()
-
-def pet_on_trade(pnl: float, confidence: float) -> None:
-    p = state["pet"]
-    conf01 = max(0.0, min(1.0, float(confidence)))
-
-    if pnl >= 0:
-        # good trades heal and reduce hunger
-        p["health"] = min(100.0, p["health"] + (2.0 + 3.0 * conf01))
-        p["hunger"] = max(0.0, p["hunger"] - (3.0 + 4.0 * conf01))
-        p["growth"] = min(100.0, p["growth"] + (0.3 + 0.6 * conf01))
-        p["mood"] = "thriving"
-    else:
-        # bad trades hurt more when confidence was high
-        hurt = 1.5 + 4.0 * conf01
-        p["health"] = max(0.0, p["health"] - hurt)
-        p["hunger"] = min(100.0, p["hunger"] + (1.0 + 2.0 * conf01))
-        p["mood"] = "weak"
-
-def survival_mode() -> str:
-    p = state["pet"]
-    if p["stage"] == "cryo" or p["mood"] == "cryo":
-        return "CRYO"
-    if p["health"] < 25:
-        return "SICK"
-    if p["hunger"] > 90:
-        return "STARVING"
-    if p["hunger"] > 75:
-        return "HUNGRY"
-    return "NORMAL"
-
-def drawdown_pct() -> float:
-    peak = max(1e-9, float(state["peak_equity"]))
-    return (peak - float(state["equity"])) / peak * 100.0
-
-# =========================
-# SIGNAL + SCANNING
-# =========================
-
-def get_signal(market: str) -> Dict[str, Any]:
-    """
-    Calls API /signal for a market.
-    Expected-ish shape:
-      { ok:true, market:"BTCUSDT", side:"buy"/"sell"/"hold", confidence:0..1, reason:"...", features:{...} }
-    We sanitize heavily so bot never crashes.
-    """
-    if not USE_SIGNAL:
-        # fallback random signal
-        s = random.uniform(-1, 1)
-        return {
-            "ok": True,
+def post_paper_event(pnl_usd: float, reason: str, market: str, side: str, confidence: float, risk_mult: float) -> None:
+    safe_post_json(
+        f"{API_BASE}/paper/event",
+        {
+            "pnl_usd": float(pnl_usd),
+            "reason": reason,
             "market": market,
-            "side": "buy" if s > 0 else "sell",
-            "confidence": abs(s),
-            "reason": "random_fallback",
-            "features": {}
-        }
-
-    j = _get("/signal", params={"market": market}, timeout=15) or {}
-    side = str(j.get("side") or "hold").lower()
-    conf = float(j.get("confidence") or 0.0)
-    features = j.get("features") or {}
-    reason = str(j.get("reason") or j.get("msg") or "api_signal")
-
-    if side not in ("buy", "sell", "hold"):
-        side = "hold"
-    conf = max(0.0, min(1.0, conf))
-
-    return {
-        "ok": bool(j.get("ok", True)),
-        "market": market,
-        "side": side,
-        "confidence": conf,
-        "reason": reason,
-        "features": features,
-    }
-
-def choose_scan_list() -> List[str]:
-    if not MARKETS:
-        return ["BTCUSDT"]
-    markets = MARKETS[:]
-    if SCAN_SHUFFLE:
-        random.shuffle(markets)
-    return markets[:max(1, min(SCAN_TOP_N, len(markets)))]
-
-def scan_best_market() -> Tuple[str, Dict[str, Any]]:
-    """
-    Option A:
-    - scan N markets each cycle
-    - pick best by confidence (abs signal)
-    - if all are hold/low confidence, return best anyway (bot will gate later)
-    """
-    scan = choose_scan_list()
-    best_sig = None
-    best_score = -1.0
-
-    for m in scan:
-        sig = get_signal(m)
-        score = float(sig.get("confidence") or 0.0)
-
-        # prefer non-hold if same confidence
-        if score > best_score:
-            best_score = score
-            best_sig = sig
-        elif best_sig is not None and score == best_score:
-            if best_sig.get("side") == "hold" and sig.get("side") != "hold":
-                best_sig = sig
-
-    if best_sig is None:
-        best_sig = get_signal("BTCUSDT")
-
-    return str(best_sig.get("market") or "BTCUSDT"), best_sig
-
-# =========================
-# BrainV2 adapter
-# =========================
-
-def build_indicators_from_features(features: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    BrainV2 expects: atr, ema_slope, adx, atr_danger.
-    We build safe proxies from whatever we get.
-    """
-    features = features or {}
-    close = float(features.get("close") or 0.0) or 1.0
-    ema_fast = float(features.get("ema_fast") or 0.0)
-    ema_slow = float(features.get("ema_slow") or 0.0)
-    trend = float(features.get("trend") or 0.0)
-
-    atr_proxy = abs(ema_fast - ema_slow) / max(1.0, close)
-    adx_proxy = min(50.0, abs(trend) * 1000.0)
-
-    return {
-        "atr": float(atr_proxy),
-        "ema_slope": float(trend),
-        "adx": float(adx_proxy),
-        "atr_danger": float(os.getenv("BRAIN_ATR_DANGER", "0.03")),
-    }
-
-# =========================
-# Paper trade
-# =========================
-
-def simulate_trade(risk_usd: float) -> float:
-    risk_usd = max(0.0, float(risk_usd))
-    win = random.random() > WIN_THRESHOLD
-    pnl = risk_usd * random.uniform(0.6, 1.6) if win else -risk_usd
-
-    state["equity"] += pnl
-    state["peak_equity"] = max(float(state["peak_equity"]), float(state["equity"]))
-    state["total_pnl_usd"] += pnl
-    state["total_trades"] += 1
-
-    if pnl > 0:
-        state["wins"] += 1
-        state["loss_streak"] = 0
-    else:
-        state["losses"] += 1
-        state["loss_streak"] += 1
-
-    return pnl
-
-# =========================
-# Prices (for dashboard charts / sanity)
-# =========================
-
-_last_prices: Dict[str, float] = {}
-
-def generate_fake_prices(markets: List[str]) -> Dict[str, float]:
-    out = {}
-    for m in markets:
-        base = _last_prices.get(m, 1000.0)
-        step = base * random.uniform(-0.002, 0.002)
-        base = max(0.1, base + step)
-        _last_prices[m] = base
-        out[m] = base
-    return out
-
-# =========================
-# Push helpers
-# =========================
-
-def push_heartbeat(prices_ok: bool = True, best_market: str = "") -> None:
-    _post("/ingest/heartbeat", {
-        "time_utc": utc_now(),
-        "status": "running",
-        "survival_mode": survival_mode(),
-        "equity_usd": float(state["equity"]),
-        "wins": int(state["wins"]),
-        "losses": int(state["losses"]),
-        "loss_streak": int(state["loss_streak"]),
-        "total_trades": int(state["total_trades"]),
-        "total_pnl_usd": float(state["total_pnl_usd"]),
-        "markets": MARKETS,
-        "best_market": best_market,
-        "open_positions": 0,
-        "prices_ok": bool(prices_ok),
-    })
-
-def push_pet_and_equity() -> None:
-    _post("/ingest/pet", {**state["pet"], "time_utc": utc_now(), "survival_mode": survival_mode()})
-    _post("/ingest/equity", {"time_utc": utc_now(), "equity_usd": float(state["equity"])})
-
-# =========================
-# CRYO triggers
-# =========================
-
-def enter_cryo(reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    state["pet"]["stage"] = "cryo"
-    state["pet"]["mood"] = "cryo"
-    log_event("cryo", reason, extra or {})
-    # Tell API if it supports /vault/lock (optional)
-    _post("/vault/lock", {"reason": reason, "extra": extra or {}})
-
-# =========================
-# MAIN LOOP
-# =========================
-
-def run() -> None:
-    log.info("Bot started. API_URL=%s cycle=%ss universe=%d scan_top_n=%d use_signal=%s use_brain=%s",
-             API_URL, CYCLE_SECONDS, len(MARKETS), SCAN_TOP_N, USE_SIGNAL, USE_BRAIN_V2)
-
-    if USE_BRAIN_V2 and brain is None:
-        log.warning("BrainV2 NOT active. Import/init error: %s", _brain_import_error or "unknown")
-
-    unlock_vault()
-
-    while True:
-        pet_tick()
-
-        ctrl = api_control()
-        mode = (ctrl.get("state") or "ACTIVE").upper()
-
-        # Push prices for charting (fake for now)
-        prices = generate_fake_prices(MARKETS[:max(1, min(len(MARKETS), 30))])
-        _post("/ingest/prices", {"time_utc": utc_now(), "prices": prices})
-
-        # No trading during CRYO/PAUSED (if your API uses it)
-        if mode in ("CRYO", "PAUSED"):
-            if mode == "CRYO":
-                state["pet"]["mood"] = "cryo"
-                state["pet"]["health"] = min(100.0, float(state["pet"]["health"]) + 0.6)
-                state["pet"]["hunger"] = min(100.0, float(state["pet"]["hunger"]) + 0.3)
-
-            push_heartbeat(prices_ok=True)
-            push_pet_and_equity()
-            log.info("%s active (%s). No trading.", mode, ctrl.get("cryo_reason") or ctrl.get("pause_reason"))
-            time.sleep(CYCLE_SECONDS)
-            continue
-
-        # =========================
-        # SCAN + PICK BEST
-        # =========================
-        best_market, sig = scan_best_market()
-        side = str(sig.get("side") or "hold").lower()
-        confidence = float(sig.get("confidence") or 0.0)
-        reason = str(sig.get("reason") or "signal")
-        features = sig.get("features") or {}
-
-        # Always update dashboard with life signs
-        push_heartbeat(prices_ok=True, best_market=best_market)
-        push_pet_and_equity()
-
-        # Basic gates
-        if side == "hold":
-            log.info("SKIP (hold): best=%s conf=%.2f reason=%s", best_market, confidence, reason)
-            time.sleep(CYCLE_SECONDS)
-            continue
-
-        if confidence < CONF_MIN_TRADE:
-            log.info("SKIP (low conf): best=%s conf=%.2f < %.2f reason=%s", best_market, confidence, CONF_MIN_TRADE, reason)
-            time.sleep(CYCLE_SECONDS)
-            continue
-
-        # =========================
-        # BRAIN V2 GATE + RISK
-        # =========================
-        brain_state = "OFF"
-        brain_reason = ""
-        brain_risk_mult = 1.0
-        allow = True
-
-        if USE_BRAIN_V2 and brain is not None:
-            try:
-                indicators = build_indicators_from_features(features)
-                decision = brain.decide(indicators=indicators, signal_score=float(confidence))
-                allow = bool(decision.allow_trade)
-                brain_state = decision.brain_state
-                brain_reason = decision.reason
-                brain_risk_mult = float(decision.risk_multiplier or 1.0)
-            except Exception as e:
-                allow = True
-                brain_state = "BRAIN_ERROR"
-                brain_reason = str(e)
-                brain_risk_mult = 1.0
-                log.warning("BrainV2 decide error (fail-open): %s", e)
-
-        if not allow:
-            log.info("BLOCKED by brain: best=%s conf=%.2f brain=%s (%s)", best_market, confidence, brain_state, brain_reason)
-            time.sleep(CYCLE_SECONDS)
-            continue
-
-        # Risk sizing (simple)
-        base_risk_usd = float(state["equity"]) * RISK_PER_TRADE
-        risk_usd = base_risk_usd * brain_risk_mult
-
-        pnl = simulate_trade(risk_usd=risk_usd)
-
-        if USE_BRAIN_V2 and brain is not None:
-            try:
-                brain.record_trade(float(pnl), equity_after=float(state["equity"]))
-            except Exception as e:
-                log.warning("BrainV2 record_trade failed: %s", e)
-
-        pet_on_trade(pnl, confidence)
-        dd = drawdown_pct()
-
-        # Post trade to API
-        _post("/paper/event", {
-            "pnl_usd": float(pnl),
-            "reason": "universe_trade",
-            "market": best_market,
             "side": side,
             "confidence": float(confidence),
-            "risk_usd": float(risk_usd),
-            "brain_state": brain_state,
-            "brain_reason": brain_reason,
-            "brain_risk_multiplier": float(brain_risk_mult),
+            "risk_mult": float(risk_mult),
             "time_utc": utc_now(),
-        })
+        },
+        timeout=10,
+    )
 
-        log.info("TRADE: market=%s side=%s conf=%.2f risk=%.2f pnl=%.2f equity=%.2f brain=%s",
-                 best_market, side.upper(), confidence, risk_usd, pnl, float(state["equity"]), brain_state)
+# ----------------------------
+# Coinbase price fetch
+# ----------------------------
+_CB_HEADERS = {"User-Agent": "Crypto-AI-Bot/1.0", "Accept": "application/json"}
 
-        # Safety: cryo triggers
-        max_loss_streak = MAX_LOSS_STREAK_DEFAULT
-        if state["loss_streak"] >= max_loss_streak:
-            enter_cryo("loss_streak", {
-                "loss_streak": int(state["loss_streak"]),
-                "threshold": int(max_loss_streak),
-                "equity": float(state["equity"]),
-                "best_market": best_market,
-            })
+def fetch_coinbase_price(product_id: str) -> Optional[float]:
+    j = safe_get_json(f"{COINBASE_BASE}/products/{product_id}/ticker", headers=_CB_HEADERS, timeout=10)
+    if not j:
+        return None
+    p = j.get("price")
+    try:
+        return float(p)
+    except Exception:
+        return None
 
-        if dd >= MAX_DRAWDOWN_PCT:
-            enter_cryo("max_drawdown", {
-                "drawdown_pct": float(dd),
-                "threshold": float(MAX_DRAWDOWN_PCT),
-                "equity": float(state["equity"]),
-                "best_market": best_market,
-            })
+# ----------------------------
+# Signal engine (simple momentum)
+# ----------------------------
+class PriceStore:
+    def __init__(self, history_len: int):
+        self.history_len = history_len
+        self.prices: Dict[str, List[float]] = {}
+
+    def add(self, market: str, price: float) -> None:
+        arr = self.prices.setdefault(market, [])
+        arr.append(float(price))
+        if len(arr) > self.history_len:
+            del arr[0 : len(arr) - self.history_len]
+
+    def ready(self, market: str, min_len: int = 8) -> bool:
+        return len(self.prices.get(market, [])) >= min_len
+
+    def momentum_signal(self, market: str) -> float:
+        """
+        Returns signal in [-1, +1] using short-vs-long MA slope.
+        """
+        arr = self.prices.get(market, [])
+        if len(arr) < 8:
+            return 0.0
+
+        n = len(arr)
+        short = max(3, n // 4)
+        long = max(6, n // 2)
+
+        ma_s = sum(arr[-short:]) / short
+        ma_l = sum(arr[-long:]) / long
+
+        # normalized diff
+        if ma_l <= 0:
+            return 0.0
+        raw = (ma_s - ma_l) / ma_l  # e.g. 0.002 = 0.2%
+
+        # squash into [-1,1]
+        return clamp(raw * 80.0, -1.0, 1.0)
+
+# ----------------------------
+# Paper outcome model (biased by confidence)
+# ----------------------------
+def simulate_pnl(risk_usd: float, confidence: float, side: str, signal: float) -> float:
+    """
+    Paper sim:
+      - win probability increases with confidence
+      - pnl magnitude scales with risk_usd
+    """
+    conf = clamp(abs(confidence), 0.0, 1.0)
+    win_prob = 0.48 + 0.22 * conf  # 48% .. 70%
+    win = (random.random() < win_prob)
+
+    # small edge: if side matches signal direction, tiny boost
+    alignment = 1.0
+    if (side == "BUY" and signal > 0) or (side == "SELL" and signal < 0):
+        alignment = 1.05
+
+    # payout distribution
+    if win:
+        return abs(risk_usd) * random.uniform(0.4, 1.2) * alignment
+    else:
+        return -abs(risk_usd) * random.uniform(0.4, 1.1)
+
+# ----------------------------
+# Pet pressure (make bot “try harder” when pet is unwell)
+# ----------------------------
+def pet_pressure(data: Optional[dict]) -> float:
+    """
+    Returns extra risk multiplier based on pet health/hunger.
+    If pet is sick/hungry -> allow slightly more aggression (still capped).
+    """
+    try:
+        pet = (data or {}).get("pet") or {}
+        h = float(pet.get("health", 100))
+        hu = float(pet.get("hunger", 100))
+    except Exception:
+        return 1.0
+
+    # if health/hunger drop, pressure increases
+    pressure = 1.0
+    if h < 60:
+        pressure += (60 - h) / 200.0   # up to +0.30
+    if hu < 60:
+        pressure += (60 - hu) / 250.0  # up to +0.24
+    return clamp(pressure, 1.0, 1.35)
+
+# ----------------------------
+# Main loop
+# ----------------------------
+def run() -> None:
+    if not UNIVERSE:
+        raise RuntimeError("UNIVERSE is empty. Set UNIVERSE env var.")
+
+    if USE_BRAIN and BrainV2 is None:
+        log.warning(f"BrainV2 import failed. Running without brain. error={_brain_import_error}")
+
+    brain = BrainV2() if (USE_BRAIN and BrainV2 is not None) else None
+
+    log.info("Starting Crypto-AI-Bot (paper mode) - Coinbase universe scanning")
+    token = unlock_vault()
+    if token:
+        log.info("Vault unlocked OK (token acquired)")
+    else:
+        log.warning("Vault unlock failed (continuing anyway)")
+
+    store = PriceStore(HISTORY_LEN)
+
+    equity = 1000.0
+    last_pnl = 0.0
+
+    # Try to seed equity from API /data if present
+    d0 = get_data()
+    try:
+        eq0 = float((d0 or {}).get("equity", {}).get("usd", equity))
+        if math.isfinite(eq0) and eq0 > 0:
+            equity = eq0
+    except Exception:
+        pass
+
+    while True:
+        data = get_data()
+        pressure = pet_pressure(data)
+
+        # 1) Fetch prices for universe + update history
+        prices: Dict[str, float] = {}
+        ok_count = 0
+        for m in UNIVERSE:
+            p = fetch_coinbase_price(m)
+            if p is None:
+                continue
+            prices[m] = p
+            store.add(m, p)
+            ok_count += 1
+
+        if ok_count == 0:
+            log.warning("No prices fetched (network or Coinbase issue). Sleeping.")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        # 2) Compute signal for each market and pick best by abs(signal)
+        best_market = None
+        best_signal = 0.0
+        for m in UNIVERSE:
+            if not store.ready(m):
+                continue
+            s = store.momentum_signal(m)
+            if abs(s) > abs(best_signal):
+                best_signal = s
+                best_market = m
+
+        if not best_market:
+            log.info("Warming up price history... (need a few cycles)")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        confidence = clamp(abs(best_signal), 0.0, 1.0)
+        side = "BUY" if best_signal > 0 else "SELL"
+
+        # 3) Gate + risk via BrainV2
+        brain_state = "allow"
+        brain_reason = "no_brain"
+        brain_risk_mult = 1.0
+
+        if brain is not None:
+            # BrainV2 should accept confidence and return (state, reason, risk_mult)
+            try:
+                brain_state, brain_reason, brain_risk_mult = brain.evaluate(confidence)
+            except Exception as e:
+                brain_state, brain_reason, brain_risk_mult = ("allow", f"brain_error:{e}", 1.0)
+
+        # Apply pet pressure, cap risk mult
+        risk_mult = clamp(float(brain_risk_mult) * pressure, 0.25, MAX_RISK_MULT)
+
+        # 4) Decide trade
+        if confidence < MIN_CONF:
+            log.info(f"SKIP (low_conf): best={best_market} conf={confidence:.2f} sig={best_signal:+.2f}")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        if str(brain_state).lower().startswith("block") or str(brain_state).lower().startswith("hold"):
+            log.info(f"SKIP ({brain_state}): best={best_market} conf={confidence:.2f} reason={brain_reason}")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        # 5) Paper trade outcome
+        risk_usd = equity * RISK_PER_TRADE * risk_mult
+        pnl = simulate_pnl(risk_usd=risk_usd, confidence=confidence, side=side, signal=best_signal)
+        equity += pnl
+        last_pnl = pnl
+
+        log.info(
+            f"TRADE: market={best_market} side={side} conf={confidence:.2f} "
+            f"risk_mult={risk_mult:.2f} pnl={pnl:+.2f} equity={equity:.2f} "
+            f"brain={brain_state} reason={brain_reason}"
+        )
+
+        # 6) Post updates so Vault/Dashboard changes
+        post_paper_event(
+            pnl_usd=pnl,
+            reason="universe_trade",
+            market=best_market,
+            side=side,
+            confidence=confidence,
+            risk_mult=risk_mult,
+        )
+        post_heartbeat(0, equity, last_pnl)
 
         time.sleep(CYCLE_SECONDS)
+
 
 if __name__ == "__main__":
     run()
