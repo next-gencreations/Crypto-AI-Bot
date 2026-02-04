@@ -1,187 +1,299 @@
-#!/usr/bin/env python3
-import os, time, math, random, logging
-from collections import deque
-from dataclasses import dataclass
+# -*- coding: utf-8 -*-
+"""
+Crypto-AI-Bot (paper mode)
+Universe scanning via Coinbase public API
+
+Features:
+- Live prices from Coinbase
+- Momentum signal engine
+- BrainV2 gate + risk multiplier
+- Vault unlock
+- Pet pressure system
+- Dashboard heartbeat + paper events
+"""
+
+import os
+import time
+import math
+import random
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 import requests
 
-# ===================== CONFIG =====================
+# ===================== ENV =====================
 
-EXCHANGE = os.getenv("EXCHANGE","coinbase").lower()
-API_BASE = os.getenv("API_BASE","https://crypto-ai-api-1-7cte.onrender.com")
-VAULT_PIN = os.getenv("VAULT_PIN","4567")
+API_BASE = os.getenv("API_BASE", "https://crypto-ai-api-1-7cte.onrender.com")
+VAULT_PIN = os.getenv("VAULT_PIN", "4567")
 
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS",15))
-HISTORY_LEN = int(os.getenv("HISTORY_LEN",30))
-MIN_CONF = float(os.getenv("MIN_CONF",0.20))
+COINBASE_BASE = "https://api.exchange.coinbase.com"
 
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE",0.015))
-MAX_RISK_MULT = float(os.getenv("MAX_RISK_MULT",1.5))
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "15"))
+HISTORY_LEN = int(os.getenv("HISTORY_LEN", "30"))
 
-STARTING_EQUITY = float(os.getenv("STARTING_EQUITY",1000))
-MAX_POS_ABS = float(os.getenv("MAX_POS_ABS",100))
-MAX_POS_PCT = float(os.getenv("MAX_POS_PCT",0.10))
-DAILY_LOSS_CAP = float(os.getenv("DAILY_LOSS_CAP",0.03))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))
+MAX_RISK_MULT = float(os.getenv("MAX_RISK_MULT", "1.50"))
+MIN_CONF = float(os.getenv("MIN_CONF", "0.20"))
 
-TAKER_FEE = 0.004
-SLIPPAGE = 0.001
+USE_BRAIN = os.getenv("USE_BRAIN", "1") != "0"
 
-UNIVERSE = os.getenv("UNIVERSE","BTC-USD,ETH-USD,SOL-USD,ADA-USD,XRP-USD,DOGE-USD").split(",")
+DEFAULT_UNIVERSE = (
+    "BTC-USD","ETH-USD","SOL-USD","ADA-USD","XRP-USD",
+    "DOGE-USD","AVAX-USD","LINK-USD","DOT-USD",
+    "LTC-USD","BCH-USD","UNI-USD","ARB-USD","OP-USD","POL-USD"
+)
 
-LIVE_MODE = os.getenv("LIVE_MODE","0") == "1"
+raw_uni = os.getenv("UNIVERSE")
+if raw_uni:
+    UNIVERSE = [x.strip().upper() for x in raw_uni.split(",")]
+else:
+    UNIVERSE = list(DEFAULT_UNIVERSE)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("BOT")
+# ===================== LOGGING =====================
 
-session = requests.Session()
-
-# ===================== EXCHANGE ADAPTERS =====================
-
-class Coinbase:
-    base = "https://api.exchange.coinbase.com"
-
-    def products(self):
-        r = session.get(self.base+"/products",timeout=10)
-        return [p["id"] for p in r.json()]
-
-    def ticker(self,s):
-        r = session.get(self.base+f"/products/{s}/ticker",timeout=10)
-        return float(r.json()["price"])
-
-class KuCoin:
-    base = "https://api.kucoin.com"
-
-    def products(self):
-        r = session.get(self.base+"/api/v2/symbols",timeout=10)
-        return [p["symbol"] for p in r.json()["data"]]
-
-    def ticker(self,s):
-        s = s.replace("-","")
-        r = session.get(self.base+"/api/v1/market/orderbook/level1",params={"symbol":s},timeout=10)
-        return float(r.json()["data"]["price"])
-
-ex = Coinbase() if EXCHANGE=="coinbase" else KuCoin()
-
-# ===================== BRAIN V3 =====================
-
-class BrainV3:
-    def evaluate(self,f):
-        mom = f["momentum"]
-        vol = f["vol"]
-        cons = f["consistency"]
-        score = (mom*1.2)+(cons*0.8)-(vol*1.5)
-        conf = 1/(1+math.exp(-score))
-        allow = conf >= MIN_CONF and vol < 2
-        return {"allow":allow,"confidence":conf,"reason":"ok"}
-
-brain = BrainV3()
-
-# ===================== PAPER BROKER =====================
-
-@dataclass
-class Position:
-    market:str
-    entry:float
-    qty:float
-    cycle:int
-
-class Broker:
-    def __init__(self):
-        self.equity = STARTING_EQUITY
-        self.day_start = STARTING_EQUITY
-        self.pos = None
-
-    def daily_loss_hit(self):
-        return (self.day_start-self.equity)/self.day_start > DAILY_LOSS_CAP
-
-    def size(self,rm):
-        raw = self.equity*RISK_PER_TRADE*rm
-        return min(raw,self.equity*MAX_POS_PCT,MAX_POS_ABS)
-
-    def open(self,m,p,rm,c):
-        v = self.size(rm)
-        qty = (v*(1-TAKER_FEE))/(p*(1+SLIPPAGE))
-        self.pos = Position(m,p,qty,c)
-        return v,qty
-
-    def close(self,p):
-        exitp = p*(1-SLIPPAGE)
-        pnl = (exitp-self.pos.entry)*self.pos.qty
-        self.equity += pnl
-        self.pos=None
-        return pnl
-
-broker = Broker()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("bot")
 
 # ===================== HELPERS =====================
 
-def momentum(pr):
-    return ((pr[-1]-pr[0])/pr[0])*100
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def stdev(xs):
-    if len(xs)<2: return 0
-    m=sum(xs)/len(xs)
-    return math.sqrt(sum((x-m)**2 for x in xs)/(len(xs)-1))
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-# ===================== INIT =====================
+def safe_get_json(url, headers=None, timeout=10):
+    try:
+        r = requests.get(url, headers=headers or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"GET failed: {url} :: {e}")
+        return None
 
-log.info("Booting bot on %s",EXCHANGE)
-products = ex.products()
-UNIVERSE = [u for u in UNIVERSE if u.replace("-","") in "".join(products)]
-log.info("Universe: %s",UNIVERSE)
+def safe_post_json(url, payload, headers=None, timeout=10):
+    try:
+        r = requests.post(url, json=payload, headers=headers or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json() if r.text else {"ok": True}
+    except Exception as e:
+        log.warning(f"POST failed: {url} :: {e}")
+        return None
 
-prices = {m:deque(maxlen=HISTORY_LEN) for m in UNIVERSE}
+# ===================== VAULT + DASHBOARD =====================
+
+def unlock_vault():
+    j = safe_post_json(f"{API_BASE}/vault/unlock", {"pin": VAULT_PIN})
+    if not j or not j.get("ok"):
+        return None
+    return j.get("token")
+
+def get_data():
+    return safe_get_json(f"{API_BASE}/data", timeout=15)
+
+def post_heartbeat(open_positions, equity, last_pnl):
+    safe_post_json(
+        f"{API_BASE}/bot/heartbeat",
+        {
+            "open_positions": open_positions,
+            "equity_usd": equity,
+            "last_pnl_usd": last_pnl,
+            "time_utc": utc_now(),
+        },
+    )
+
+def post_paper_event(pnl, reason, market, side, confidence, risk_mult):
+    safe_post_json(
+        f"{API_BASE}/paper/event",
+        {
+            "pnl_usd": float(pnl),
+            "reason": reason,
+            "market": market,
+            "side": side,
+            "confidence": float(confidence),
+            "risk_mult": float(risk_mult),
+            "time_utc": utc_now(),
+        },
+    )
+
+# ===================== COINBASE =====================
+
+_CB_HEADERS = {"User-Agent": "Crypto-AI-Bot/1.0"}
+
+def fetch_coinbase_price(product_id):
+    j = safe_get_json(f"{COINBASE_BASE}/products/{product_id}/ticker", headers=_CB_HEADERS)
+    if not j:
+        return None
+    try:
+        return float(j.get("price"))
+    except:
+        return None
+
+# ===================== PRICE STORE =====================
+
+class PriceStore:
+    def __init__(self, history_len):
+        self.history_len = history_len
+        self.prices: Dict[str, List[float]] = {}
+
+    def add(self, market, price):
+        arr = self.prices.setdefault(market, [])
+        arr.append(float(price))
+        if len(arr) > self.history_len:
+            del arr[0:len(arr) - self.history_len]
+
+    def ready(self, market, min_len=8):
+        return len(self.prices.get(market, [])) >= min_len
+
+    def momentum_signal(self, market):
+        arr = self.prices.get(market, [])
+        if len(arr) < 8:
+            return 0.0
+
+        n = len(arr)
+        short = max(3, n // 4)
+        long = max(6, n // 2)
+
+        ma_s = sum(arr[-short:]) / short
+        ma_l = sum(arr[-long:]) / long
+
+        if ma_l <= 0:
+            return 0.0
+
+        raw = (ma_s - ma_l) / ma_l
+        return clamp(raw * 80.0, -1.0, 1.0)
+
+# ===================== PAPER SIM =====================
+
+def simulate_pnl(risk_usd, confidence, side, signal):
+    conf = clamp(abs(confidence), 0.0, 1.0)
+    win_prob = 0.48 + 0.22 * conf
+    win = random.random() < win_prob
+
+    alignment = 1.0
+    if (side == "BUY" and signal > 0) or (side == "SELL" and signal < 0):
+        alignment = 1.05
+
+    if win:
+        return abs(risk_usd) * random.uniform(0.4, 1.2) * alignment
+    else:
+        return -abs(risk_usd) * random.uniform(0.4, 1.1)
+
+# ===================== PET PRESSURE =====================
+
+def pet_pressure(data):
+    try:
+        pet = (data or {}).get("pet") or {}
+        h = float(pet.get("health", 100))
+        hu = float(pet.get("hunger", 100))
+    except:
+        return 1.0
+
+    pressure = 1.0
+    if h < 60:
+        pressure += (60 - h) / 200.0
+    if hu < 60:
+        pressure += (60 - hu) / 250.0
+
+    return clamp(pressure, 1.0, 1.35)
 
 # ===================== MAIN LOOP =====================
 
-cycle=0
-while True:
-    cycle+=1
-
-    if broker.daily_loss_hit():
-        log.warning("DAILY LOSS CAP HIT")
-        time.sleep(60)
-        continue
-
-    best=None; best_score=-999; best_price=None; best_feat=None
-
-    for m in UNIVERSE:
-        try:
-            p = ex.ticker(m)
-        except:
-            continue
-        prices[m].append(p)
-        if len(prices[m])<5: continue
-
-        mom = momentum(prices[m])
-        rets=[(prices[m][i]-prices[m][i-1])/prices[m][i-1] for i in range(1,len(prices[m]))]
-        vol = stdev(rets)
-        cons = sum(1 for r in rets if r>0)/len(rets)
-        score = mom-(vol*0.4)
-
-        if score>best_score:
-            best_score=score
-            best=m
-            best_price=p
-            best_feat={"momentum":mom,"vol":vol,"consistency":cons}
-
-    if not best:
-        log.info("SKIP no data")
-        time.sleep(CYCLE_SECONDS)
-        continue
-
-    gate = brain.evaluate(best_feat)
-    conf = gate["confidence"]
-    rm = 1+(conf*(MAX_RISK_MULT-1))
-
-    if broker.pos:
-        if cycle-broker.pos.cycle>=1 or conf<MIN_CONF:
-            pnl = broker.close(best_price)
-            log.info("CLOSE %s pnl=%.2f equity=%.2f",best,pnl,broker.equity)
+def run():
+    log.info("Starting Crypto-AI-Bot (paper mode) - Coinbase universe")
+    token = unlock_vault()
+    if token:
+        log.info("Vault unlocked OK")
     else:
-        if conf>=MIN_CONF and gate["allow"]:
-            v,qty = broker.open(best,best_price,rm,cycle)
-            log.info("OPEN %s conf=%.2f size=%.2f equity=%.2f",best,conf,v,broker.equity)
-        else:
-            log.info("SKIP %s conf=%.2f",best,conf)
+        log.warning("Vault unlock failed (continuing anyway)")
 
-    time.sleep(CYCLE_SECONDS)
+    store = PriceStore(HISTORY_LEN)
+    equity = 1000.0
+    last_pnl = 0.0
+
+    d0 = get_data()
+    try:
+        eq0 = float((d0 or {}).get("equity", {}).get("usd", equity))
+        if math.isfinite(eq0) and eq0 > 0:
+            equity = eq0
+    except:
+        pass
+
+    while True:
+        data = get_data()
+        pressure = pet_pressure(data)
+
+        prices = {}
+        ok = 0
+        for m in UNIVERSE:
+            p = fetch_coinbase_price(m)
+            if p is None:
+                continue
+            prices[m] = p
+            store.add(m, p)
+            ok += 1
+
+        if ok == 0:
+            log.warning("No prices fetched")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        best_market = None
+        best_signal = 0.0
+
+        for m in UNIVERSE:
+            if not store.ready(m):
+                continue
+            s = store.momentum_signal(m)
+            if abs(s) > abs(best_signal):
+                best_signal = s
+                best_market = m
+
+        if not best_market:
+            log.info("Warming up price history...")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        confidence = clamp(abs(best_signal), 0.0, 1.0)
+        side = "BUY" if best_signal > 0 else "SELL"
+
+        if confidence < MIN_CONF:
+            log.info(f"SKIP low confidence {confidence:.2f}")
+            post_heartbeat(0, equity, last_pnl)
+            time.sleep(CYCLE_SECONDS)
+            continue
+
+        risk_mult = clamp(pressure, 0.25, MAX_RISK_MULT)
+
+        risk_usd = equity * RISK_PER_TRADE * risk_mult
+        pnl = simulate_pnl(risk_usd, confidence, side, best_signal)
+        equity += pnl
+        last_pnl = pnl
+
+        log.info(
+            f"TRADE {best_market} {side} "
+            f"conf={confidence:.2f} "
+            f"risk_mult={risk_mult:.2f} "
+            f"pnl={pnl:+.2f} "
+            f"equity={equity:.2f}"
+        )
+
+        post_paper_event(
+            pnl=pnl,
+            reason="universe_trade",
+            market=best_market,
+            side=side,
+            confidence=confidence,
+            risk_mult=risk_mult,
+        )
+
+        post_heartbeat(0, equity, last_pnl)
+        time.sleep(CYCLE_SECONDS)
+
+if __name__ == "__main__":
+    run()
