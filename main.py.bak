@@ -20,7 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import requests
-from brain_v2 import BrainV2
+
 # ===================== ENV =====================
 
 API_BASE = os.getenv("API_BASE", "https://crypto-ai-api-1-7cte.onrender.com")
@@ -211,8 +211,6 @@ def run():
         log.warning("Vault unlock failed (continuing anyway)")
 
     store = PriceStore(HISTORY_LEN)
-    brain = BrainV2(enabled=USE_BRAIN)
-    log.info(f"BrainV2 enabled={USE_BRAIN}")
     equity = 1000.0
     last_pnl = 0.0
 
@@ -276,7 +274,7 @@ def run():
         pnl = simulate_pnl(risk_usd, confidence, side, best_signal)
         equity += pnl
         last_pnl = pnl
-        brain.update(best_market, pnl)
+
         log.info(
             f"TRADE {best_market} {side} "
             f"conf={confidence:.2f} "

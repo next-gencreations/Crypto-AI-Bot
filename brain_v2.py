@@ -1,127 +1,152 @@
 # brain_v2.py
-from dataclasses import dataclass
-from typing import Dict, Optional, Any
-import math
+# Simple online-learning gate for paper trading.
+# Learns per-market outcomes and can reduce risk or veto trades when performance is poor.
+
+import json
+import os
+import time
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 @dataclass
-class BrainDecision:
-    allow_trade: bool
-    confidence: float
-    risk_multiplier: float
-    reason: str
+class MarketStats:
+    n: int = 0
+    ewma_pnl: float = 0.0     # exponentially weighted average pnl in USD
+    ewma_win: float = 0.5     # exponentially weighted win rate
+    last_ts: float = 0.0
 
 class BrainV2:
     """
-    Decision brain with:
-    - confidence gating
-    - risk scaling
-    - loss-streak protection
-    - companion-pressure modifier (health/hunger)
+    evaluate() returns:
+      - allow: bool (gate trade)
+      - confidence: float (adjusted 0..1)
+      - risk_mult: float (risk multiplier adjustment)
+      - note: str
     """
 
-    def __init__(
-        self,
-        base_conf_min: float = 0.62,
-        base_risk_mult: float = 1.0,
-        max_risk_mult: float = 1.6,
-        loss_streak_soft_limit: int = 3,
-        loss_streak_hard_limit: int = 6,
-    ):
-        self.base_conf_min = base_conf_min
-        self.base_risk_mult = base_risk_mult
-        self.max_risk_mult = max_risk_mult
-        self.loss_streak_soft_limit = loss_streak_soft_limit
-        self.loss_streak_hard_limit = loss_streak_hard_limit
+    def __init__(self,
+                 enabled: bool = True,
+                 state_path: str = "brain_state.json",
+                 alpha: float = 0.12,           # learning rate for EWMA
+                 min_trades_to_trust: int = 12, # needs some history before strong gating
+                 hard_veto_winrate: float = 0.42,
+                 soft_veto_winrate: float = 0.46):
+        self.enabled = enabled
+        self.state_path = state_path
+        self.alpha = alpha
+        self.min_trades_to_trust = min_trades_to_trust
+        self.hard_veto_winrate = hard_veto_winrate
+        self.soft_veto_winrate = soft_veto_winrate
+        self.stats: Dict[str, MarketStats] = {}
+        self._dirty = False
+        self._last_save = 0.0
+        self.load()
 
-        self.loss_streak = 0
-        self.win_streak = 0
+    def load(self) -> None:
+        try:
+            if os.path.exists(self.state_path):
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                raw = data.get("stats", {})
+                for m, s in raw.items():
+                    self.stats[m] = MarketStats(**s)
+        except Exception:
+            # Safe fail: no crash
+            self.stats = {}
 
-    def update_result(self, pnl: float):
-        if pnl > 0:
-            self.win_streak += 1
-            self.loss_streak = 0
-        elif pnl < 0:
-            self.loss_streak += 1
-            self.win_streak = 0
+    def save(self, force: bool = False) -> None:
+        if not self._dirty and not force:
+            return
+        now = time.time()
+        if not force and (now - self._last_save) < 30:
+            return
+        try:
+            payload = {"stats": {m: asdict(s) for m, s in self.stats.items()}}
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+            self._dirty = False
+            self._last_save = now
+        except Exception:
+            # Safe fail: no crash
+            pass
 
-    def _companion_pressure(self, companion: Optional[Dict[str, Any]]) -> Dict[str, float]:
-        """
-        Convert companion needs into trade behaviour changes.
-        SAFE version:
-          - low health/hunger => raise confidence threshold
-          - low health/hunger => reduce risk
-        """
-        if not companion:
-            return {"conf_boost": 0.0, "risk_scale": 1.0, "pressure": 0.0}
+    def evaluate(self,
+                 market: str,
+                 base_confidence: float,
+                 pressure: float,
+                 equity: float) -> dict:
+        # If disabled, pass-through
+        if not self.enabled:
+            return {
+                "allow": True,
+                "confidence": clamp(base_confidence, 0.0, 1.0),
+                "risk_mult": 1.0,
+                "note": "brain_disabled",
+            }
 
-        health = float(companion.get("health", 100))
-        hunger = float(companion.get("hunger", 100))
+        base_confidence = clamp(base_confidence, 0.0, 1.0)
 
-        # pressure 0..1 (1 = urgent)
-        # hunger <= 20 or health <= 30 begins to bite
-        p_h = max(0.0, (30.0 - health) / 30.0)
-        p_u = max(0.0, (20.0 - hunger) / 20.0)
-        pressure = max(p_h, p_u)
-        pressure = max(0.0, min(1.0, pressure))
+        s = self.stats.get(market, MarketStats())
+        n = s.n
+        win = clamp(s.ewma_win, 0.0, 1.0)
 
-        # Make it *more selective* when pressure high
-        conf_boost = 0.10 * pressure  # up to +0.10 required confidence
+        # Start with neutral adjustments
+        allow = True
+        conf = base_confidence
+        risk_adj = 1.0
+        note = "neutral"
 
-        # Risk down when pressure high (do NOT size up)
-        risk_scale = 1.0 - 0.35 * pressure  # down to 0.65x
+        # Don’t overreact until we have enough trades
+        if n < self.min_trades_to_trust:
+            # small gentle shaping only
+            conf *= (0.95 + 0.10 * win)  # win 0.5 -> 1.0x, win 0.8 -> 1.03x
+            risk_adj *= (0.90 + 0.25 * win)  # win 0.5 -> 1.02x, win 0.3 -> 0.98x
+            note = f"warmup n={n} win={win:.2f}"
+        else:
+            # If winrate is poor, reduce risk and maybe veto weak signals
+            if win <= self.hard_veto_winrate and base_confidence < 0.35:
+                allow = False
+                note = f"hard_veto n={n} win={win:.2f}"
+            elif win <= self.soft_veto_winrate and base_confidence < 0.28:
+                allow = False
+                note = f"soft_veto n={n} win={win:.2f}"
+            else:
+                # Adjust confidence and risk based on winrate
+                conf *= (0.85 + 0.30 * win)  # win 0.5 -> 1.00x, win 0.7 -> 1.06x, win 0.3 -> 0.94x
+                # Stronger risk reduction when winrate is low
+                risk_adj *= clamp(0.65 + 0.85 * win, 0.65, 1.25)
+                note = f"learned n={n} win={win:.2f}"
 
-        return {"conf_boost": conf_boost, "risk_scale": risk_scale, "pressure": pressure}
+        # Additional safety: if “pressure” is high (pet unhealthy), reduce risk slightly
+        # pressure in your system is 1.0..1.35
+        risk_adj *= clamp(1.05 - (pressure - 1.0) * 0.35, 0.75, 1.05)
 
-    def decide(
-        self,
-        signal_score: float,
-        indicators: Optional[Dict[str, float]] = None,
-        companion: Optional[Dict[str, Any]] = None,
-    ) -> BrainDecision:
-        """
-        signal_score: -1..+1 (direction+strength)
-        indicators: optional dict (rsi, trend, vol, etc) for reason text
-        companion: {health,hunger,stage,mood}
-        """
+        return {
+            "allow": allow,
+            "confidence": clamp(conf, 0.0, 1.0),
+            "risk_mult": clamp(risk_adj, 0.50, 1.35),
+            "note": note,
+        }
 
-        # Base confidence from signal magnitude
-        confidence = min(1.0, max(0.0, abs(signal_score)))
+    def update(self, market: str, pnl_usd: float) -> None:
+        if not self.enabled:
+            return
+        s = self.stats.get(market)
+        if not s:
+            s = MarketStats()
+            self.stats[market] = s
 
-        # Companion pressure modifies behaviour
-        cp = self._companion_pressure(companion)
-        conf_min = min(0.90, self.base_conf_min + cp["conf_boost"])
+        s.n += 1
+        win = 1.0 if pnl_usd > 0 else 0.0
 
-        # Loss-streak protection: if losing, get stricter
-        if self.loss_streak >= self.loss_streak_hard_limit:
-            return BrainDecision(False, confidence, 0.0, f"blocked: hard loss streak ({self.loss_streak})")
+        a = self.alpha
+        # EWMA updates
+        s.ewma_pnl = (1 - a) * s.ewma_pnl + a * float(pnl_usd)
+        s.ewma_win = (1 - a) * s.ewma_win + a * win
+        s.last_ts = time.time()
 
-        if self.loss_streak >= self.loss_streak_soft_limit:
-            conf_min = min(0.92, conf_min + 0.06)
-
-        # Decide allow/deny
-        if confidence < conf_min:
-            why = f"blocked: confidence {confidence:.2f} < {conf_min:.2f}"
-            if cp["pressure"] > 0:
-                why += f" (companion pressure {cp['pressure']:.2f})"
-            return BrainDecision(False, confidence, 0.0, why)
-
-        # Risk multiplier: small boost on win streak, reduce on loss streak, and scale down if companion pressure high
-        risk = self.base_risk_mult
-
-        if self.win_streak >= 3:
-            risk *= 1.10
-        if self.loss_streak >= 1:
-            risk *= max(0.70, 1.0 - 0.12 * self.loss_streak)
-
-        risk *= cp["risk_scale"]
-        risk = max(0.25, min(self.max_risk_mult, risk))
-
-        reason = "allowed"
-        if cp["pressure"] > 0:
-            reason += f" (companion pressure {cp['pressure']:.2f}, safer mode)"
-        if self.loss_streak:
-            reason += f" (loss_streak={self.loss_streak})"
-        if self.win_streak:
-            reason += f" (win_streak={self.win_streak})"
-
-        return BrainDecision(True, confidence, risk, reason)
+        self._dirty = True
+        self.save()
