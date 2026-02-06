@@ -34,15 +34,23 @@ HISTORY_LEN = int(os.getenv("HISTORY_LEN", "30"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))
 MAX_RISK_MULT = float(os.getenv("MAX_RISK_MULT", "1.50"))
 MIN_CONF = float(os.getenv("MIN_CONF", "0.20"))
-
 USE_BRAIN = os.getenv("USE_BRAIN", "1") != "0"
+
+# ===== REALISM CONTROLS (paper trading) =====
+FEE_BPS = float(os.getenv("FEE_BPS", "6"))
+SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "10"))
+MAX_RISK_USD = float(os.getenv("MAX_RISK_USD", "25"))
 
 DEFAULT_UNIVERSE = (
     "BTC-USD","ETH-USD","SOL-USD","ADA-USD","XRP-USD",
     "DOGE-USD","AVAX-USD","LINK-USD","DOT-USD",
     "LTC-USD","BCH-USD","UNI-USD","ARB-USD","OP-USD","POL-USD"
 )
-
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BIG_ALERT_USD = float(os.getenv("BIG_ALERT_USD", "100"))
+EQUITY_HIGH_ALERT_USD = float(os.getenv("EQUITY_HIGH_ALERT_USD", "250"))  # alert every +$250 new high
+STATE_FILE = os.getenv("STATE_FILE", "brain_state.json")
 raw_uni = os.getenv("UNIVERSE")
 if raw_uni:
     UNIVERSE = [x.strip().upper() for x in raw_uni.split(",")]
@@ -82,7 +90,57 @@ def safe_post_json(url, payload, headers=None, timeout=10):
     except Exception as e:
         log.warning(f"POST failed: {url} :: {e}")
         return None
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except:
+        pass
+def maybe_equity_high_alert(equity: float):
+    """
+    Sends a Telegram alert when equity makes a new high, but only if it beats the previous
+    high by at least EQUITY_HIGH_ALERT_USD to avoid spam.
+    Stores the last high inside STATE_FILE.
+    """
+    try:
+        if EQUITY_HIGH_ALERT_USD <= 0:
+            return
 
+        # load state
+        state = {}
+        try:
+            with open(STATE_FILE, "r") as f:
+                import json
+                state = json.load(f) or {}
+        except Exception:
+            state = {}
+
+        last_high = float(state.get("equity_high", -1e18))
+
+        # first run: set baseline high, no alert
+        if last_high < -1e17:
+            state["equity_high"] = equity
+            with open(STATE_FILE, "w") as f:
+                import json
+                json.dump(state, f)
+            return
+
+        # alert only if we beat last_high by threshold
+        if equity >= last_high + EQUITY_HIGH_ALERT_USD:
+            state["equity_high"] = equity
+            with open(STATE_FILE, "w") as f:
+                import json
+                json.dump(state, f)
+
+            send_telegram(
+                f"🏁 NEW EQUITY HIGH!\n"
+                f"Equity: ${equity:.2f}\n"
+                f"Beat prior high by: ${EQUITY_HIGH_ALERT_USD:.2f}+"
+            )
+    except Exception:
+        pass
 # ===================== VAULT + DASHBOARD =====================
 
 def unlock_vault():
@@ -273,9 +331,25 @@ def run():
         risk_mult = clamp(pressure, 0.25, MAX_RISK_MULT)
 
         risk_usd = equity * RISK_PER_TRADE * risk_mult
+
+        # Guardrail: cap absolute risk USD (stops equity going crazy)
+        risk_usd = min(risk_usd, MAX_RISK_USD)
+
         pnl = simulate_pnl(risk_usd, confidence, side, best_signal)
+
+        # Realism: fees + slippage (basis points)
+        cost_bps = FEE_BPS + SLIPPAGE_BPS
+        pnl = pnl * (1.0 - (cost_bps / 10000.0))
         equity += pnl
         last_pnl = pnl
+        maybe_equity_high_alert(equity)
+        if abs(pnl) >= BIG_ALERT_USD:
+            send_telegram(
+                f"🚨 BIG TRADE ALERT\n"
+                f"{best_market} {side}\n"
+                f"PnL: ${pnl:.2f}\n"
+                f"Equity: ${equity:.2f}"
+            )
         brain.update(best_market, pnl)
         log.info(
             f"TRADE {best_market} {side} "
