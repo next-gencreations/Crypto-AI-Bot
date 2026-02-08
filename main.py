@@ -35,6 +35,8 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.015"))
 MAX_RISK_MULT = float(os.getenv("MAX_RISK_MULT", "1.50"))
 MIN_CONF = float(os.getenv("MIN_CONF", "0.20"))
 USE_BRAIN = os.getenv("USE_BRAIN", "1") != "0"
+START_EQUITY = float(os.getenv("START_EQUITY", "1000"))
+LOAD_EQUITY_FROM_DASH = os.getenv("LOAD_EQUITY_FROM_DASH", "0") == "1"
 
 # ===== REALISM CONTROLS (paper trading) =====
 FEE_BPS = float(os.getenv("FEE_BPS", "6"))
@@ -271,16 +273,17 @@ def run():
     store = PriceStore(HISTORY_LEN)
     brain = BrainV2(enabled=USE_BRAIN)
     log.info(f"BrainV2 enabled={USE_BRAIN}")
-    equity = 1000.0
+    equity = START_EQUITY
     last_pnl = 0.0
 
     d0 = get_data()
-    try:
-        eq0 = float((d0 or {}).get("equity", {}).get("usd", equity))
-        if math.isfinite(eq0) and eq0 > 0:
-            equity = eq0
-    except:
-        pass
+    if LOAD_EQUITY_FROM_DASH:
+        try:
+            eq0 = float((d0 or {}).get("equity", 0))
+            if math.isfinite(eq0) and eq0 > 0:
+                equity = eq0
+        except:
+            pass
 
     while True:
         data = get_data()
